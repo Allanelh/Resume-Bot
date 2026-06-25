@@ -1111,7 +1111,7 @@ function App() {
                           className="px-6 py-2 rounded-lg shadow hover:shadow-md transition-shadow text-white font-medium"
                           style={{ backgroundColor: '#FE9900' }}
                         >
-                          Load More ({message.allResults.length - (message.displayCount || 10)} remaining)
+                          Load 10 More Results ({message.allResults.length - (message.displayCount || 10)} remaining)
                         </button>
                       </div>
                     )}
