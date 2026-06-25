@@ -109,36 +109,61 @@ export default function ConfigModal({ onClose, currentUrl, onSave }: ConfigModal
     }
 
     setIsIndexing(true);
-    setMessage('');
+    setMessage('Starting indexing process...');
 
     try {
-      const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/index-resumes`;
+      let hasMore = true;
+      let currentOffset = 0;
+      let totalIndexed = 0;
+      let totalSkipped = 0;
+      let totalUpdated = 0;
+      let totalFiles = 0;
 
-      const response = await fetch(apiUrl, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ sharePointUrl }),
-      });
+      // Loop through batches until the backend says there are no more files
+      while (hasMore) {
+        setMessage(`Indexing batch... (Processed ${currentOffset} files so far)`);
+        
+        // Pass the current offset to the backend URL
+        const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/index-resumes?offset=${currentOffset}`;
 
-      const result = await response.json();
+        const response = await fetch(apiUrl, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ sharePointUrl }),
+        });
 
-      if (response.ok) {
-        const parts = [];
-        if (result.indexed > 0) parts.push(`${result.indexed} new`);
-        if (result.updated > 0) parts.push(`${result.updated} updated`);
-        if (result.skipped > 0) parts.push(`${result.skipped} skipped (unchanged)`);
+        const result = await response.json();
 
-        const summary = parts.length > 0 ? parts.join(', ') : 'No changes';
-        setMessage(`Indexing complete: ${summary}. Total files: ${result.total || 0}`);
-      } else {
-        setMessage(result.error || 'Error indexing resumes. Please try again.');
+        if (!response.ok) {
+          throw new Error(result.error || 'Error indexing resumes.');
+        }
+
+        // Accumulate the numbers from this specific batch
+        totalIndexed += (result.indexed || 0);
+        totalUpdated += (result.updated || 0);
+        totalSkipped += (result.skipped || 0);
+        totalFiles = result.total || totalFiles;
+
+        // Update loop conditions for the next run
+        hasMore = result.hasMore;
+        currentOffset += (result.batchSize || 20);
       }
+
+      // Final summary once all batches are completely finished
+      const parts = [];
+      if (totalIndexed > 0) parts.push(`${totalIndexed} new`);
+      if (totalUpdated > 0) parts.push(`${totalUpdated} updated`);
+      if (totalSkipped > 0) parts.push(`${totalSkipped} skipped (unchanged)`);
+
+      const summary = parts.length > 0 ? parts.join(', ') : 'No changes';
+      setMessage(`Indexing complete: ${summary}. Total files: ${totalFiles}`);
+      
     } catch (error) {
       console.error('Error indexing resumes:', error);
-      setMessage('Error connecting to indexing service. Please try again.');
+      setMessage(error instanceof Error ? error.message : 'Error connecting to indexing service. Please try again.');
     } finally {
       setIsIndexing(false);
     }
