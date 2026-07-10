@@ -20,6 +20,10 @@ interface Message {
 interface ChatMessageProps {
   message: Message;
   onTypingTick?: () => void;
+  expandedSkills: Set<string>;
+  snippetCursors: Record<string, number>;
+  onToggleSkills: (resultId: string) => void;
+  onShowNextSnippet: (resultId: string, total: number) => void;
 }
 
 const INTENT_CONFIG: Record<ConversationIntent, { label: string; icon: React.ReactNode; color: string; bg: string }> = {
@@ -31,7 +35,7 @@ const INTENT_CONFIG: Record<ConversationIntent, { label: string; icon: React.Rea
   NEW:     { label: 'New search',                     icon: null, color: '', bg: '' },
 };
 
-const REASON_CONFIG: Record<string, { icon: React.ReactNode; bg: string; text: string; border: string }> = {
+export const REASON_CONFIG: Record<string, { icon: React.ReactNode; bg: string; text: string; border: string }> = {
   degree:     { icon: <GraduationCap className="w-3.5 h-3.5" />, bg: '#EFF6FF', text: '#1D4ED8', border: '#BFDBFE' },
   field:      { icon: <BookOpen className="w-3.5 h-3.5" />,      bg: '#F0FDF4', text: '#15803D', border: '#BBF7D0' },
   cert:       { icon: <Award className="w-3.5 h-3.5" />,         bg: '#FFFBEB', text: '#B45309', border: '#FDE68A' },
@@ -67,17 +71,15 @@ function ActionTextBlock({ text, actionType }: { text: string; actionType?: stri
   while (i < lines.length) {
     const line = lines[i];
 
-    // Horizontal rule
     if (/^---+$/.test(line.trim())) {
       nodes.push(<hr key={i} className="border-slate-200 my-3" />);
       i++; continue;
     }
 
-    // Table header
     if (line.trim().startsWith('|') && lines[i + 1]?.trim().startsWith('|---')) {
       const headers = line.trim().split('|').filter(c => c.trim()).map(c => c.trim());
       const rows: string[][] = [];
-      i += 2; // skip header + separator
+      i += 2;
       while (i < lines.length && lines[i].trim().startsWith('|')) {
         rows.push(lines[i].trim().split('|').filter(c => c.trim()).map(c => c.trim()));
         i++;
@@ -111,7 +113,6 @@ function ActionTextBlock({ text, actionType }: { text: string; actionType?: stri
       continue;
     }
 
-    // Blockquote
     if (line.startsWith('> ')) {
       nodes.push(
         <blockquote key={i} className="border-l-4 border-slate-300 pl-3 my-1 text-slate-600 italic text-sm">
@@ -121,7 +122,6 @@ function ActionTextBlock({ text, actionType }: { text: string; actionType?: stri
       i++; continue;
     }
 
-    // Bullet
     if (line.startsWith('• ') || line.startsWith('  • ')) {
       const indent = line.startsWith('  ') ? 'ml-4' : '';
       nodes.push(
@@ -133,7 +133,6 @@ function ActionTextBlock({ text, actionType }: { text: string; actionType?: stri
       i++; continue;
     }
 
-    // Numbered list
     if (/^\d+\.\s/.test(line)) {
       const [num, ...rest] = line.split('. ');
       nodes.push(
@@ -145,13 +144,11 @@ function ActionTextBlock({ text, actionType }: { text: string; actionType?: stri
       i++; continue;
     }
 
-    // Empty line → spacer
     if (!line.trim()) {
       nodes.push(<div key={i} className="h-2" />);
       i++; continue;
     }
 
-    // Default: paragraph with inline bold
     nodes.push(
       <p key={i} className="text-sm text-slate-700 leading-relaxed">
         {renderInline(line)}
@@ -205,15 +202,13 @@ function MatchReasonDisplay({ reasons, fallback }: { reasons?: MatchReason[]; fa
   );
 }
 
-const SKILLS_PREVIEW = 5;
+export const SKILLS_PREVIEW = 5;
 
 const toTitleCase = (str: string) => str.replace(/\b\w/g, (c) => c.toUpperCase());
 
-export default function ChatMessage({ message, onTypingTick }: ChatMessageProps) {
+export default function ChatMessage({ message, onTypingTick, expandedSkills, snippetCursors, onToggleSkills, onShowNextSnippet }: ChatMessageProps) {
   const isUser = message.type === 'user';
   const [downloading, setDownloading] = useState<string | null>(null);
-  const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set());
-  const [snippetCursors, setSnippetCursors] = useState<Record<string, number>>({});
 
   // ── Typewriter effect for streamed bot messages ───────────────────────────
   const fullText = message.content;
@@ -229,7 +224,6 @@ export default function ChatMessage({ message, onTypingTick }: ChatMessageProps)
     }
     charIndexRef.current = 0;
     setDisplayedText('');
-    // Speed: ~18ms per char — fast enough to feel live, slow enough to be visible
     const interval = setInterval(() => {
       charIndexRef.current += 1;
       setDisplayedText(fullText.slice(0, charIndexRef.current));
@@ -242,25 +236,7 @@ export default function ChatMessage({ message, onTypingTick }: ChatMessageProps)
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [message.id, message.isStreaming]);
 
-  const toggleSkills = (resultId: string) => {
-    setExpandedSkills(prev => {
-      const next = new Set(prev);
-      if (next.has(resultId)) next.delete(resultId);
-      else next.add(resultId);
-      return next;
-    });
-  };
-
   const getSnippetCount = (resultId: string) => snippetCursors[resultId] ?? 1;
-
-  const showNextSnippet = (resultId: string, total: number) => {
-    setSnippetCursors(prev => {
-      const current = prev[resultId] ?? 1;
-      // If already showing all, collapse back to 1
-      if (current >= total) return { ...prev, [resultId]: 1 };
-      return { ...prev, [resultId]: current + 1 };
-    });
-  };
 
   const handleDownload = async (result: SearchResult) => {
     setDownloading(result.id);
@@ -319,7 +295,6 @@ export default function ChatMessage({ message, onTypingTick }: ChatMessageProps)
       )}
 
       <div className={`flex-1 max-w-3xl ${isUser ? 'flex justify-end' : ''}`}>
-        {/* Intent context banner */}
         {intentCfg && (
           <div
             className="flex items-center gap-1.5 px-3 py-1.5 rounded-t-lg text-xs font-medium mb-0.5"
@@ -391,9 +366,7 @@ export default function ChatMessage({ message, onTypingTick }: ChatMessageProps)
                       <div className="flex items-start gap-2 pt-2">
                         <Code2 className="w-4 h-4 mt-0.5 flex-shrink-0" style={{ color: '#FE9900' }} />
                         <div className="flex-1">
-                          <span className="text-sm font-medium text-slate-600">
-                            Skills:
-                          </span>
+                          <span className="text-sm font-medium text-slate-600">Skills:</span>
                           <div className="flex flex-wrap gap-1.5 mt-1.5">
                             {(expandedSkills.has(result.id) ? result.skills : result.skills.slice(0, SKILLS_PREVIEW)).map((skill, idx) => (
                               <span
@@ -415,10 +388,10 @@ export default function ChatMessage({ message, onTypingTick }: ChatMessageProps)
                             ))}
                             {result.skills.length > SKILLS_PREVIEW && (
                               <button
-                                onClick={() => toggleSkills(result.id)}
+                                onClick={() => onToggleSkills(result.id)}
                                 className="px-2.5 py-1 text-xs rounded-md font-medium transition-colors"
                                 style={{
-                                  backgroundColor: expandedSkills.has(result.id) ? '#FFF5E6' : '#FFF5E6',
+                                  backgroundColor: '#FFF5E6',
                                   color: '#E68A00',
                                   borderColor: '#FED7AA',
                                   borderWidth: '1px',
@@ -441,9 +414,7 @@ export default function ChatMessage({ message, onTypingTick }: ChatMessageProps)
                       <div className="flex items-start gap-2 pt-1">
                         <Award className="w-4 h-4 text-amber-600 mt-0.5 flex-shrink-0" />
                         <div className="flex-1">
-                          <span className="text-sm font-medium text-slate-600">
-                            Certifications:
-                          </span>
+                          <span className="text-sm font-medium text-slate-600">Certifications:</span>
                           <div className="flex flex-wrap gap-1.5 mt-1.5">
                             {result.certifications.map((cert, idx) => (
                               <span
@@ -465,9 +436,7 @@ export default function ChatMessage({ message, onTypingTick }: ChatMessageProps)
                       const showingAll = visible >= total;
                       return (
                         <div className="mt-3 pt-3 border-t border-slate-200">
-                          <span className="text-sm font-medium text-slate-600">
-                            Relevant Excerpts:
-                          </span>
+                          <span className="text-sm font-medium text-slate-600">Relevant Excerpts:</span>
                           <div className="mt-2 space-y-2">
                             {result.matchedSnippets.slice(0, visible).map((snippet, idx) => (
                               <div
@@ -480,7 +449,7 @@ export default function ChatMessage({ message, onTypingTick }: ChatMessageProps)
                           </div>
                           {total > 1 && (
                             <button
-                              onClick={() => showNextSnippet(result.id, total)}
+                              onClick={() => onShowNextSnippet(result.id, total)}
                               className="mt-2 text-xs font-medium transition-colors"
                               style={{ color: '#E68A00' }}
                               onMouseEnter={(e) => { e.currentTarget.style.color = '#B86E00'; }}

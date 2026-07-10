@@ -1,7 +1,6 @@
-//dummy comment
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Settings, Send, Loader2, Download, ChevronDown, Bot } from 'lucide-react';
-import ChatMessage from './components/ChatMessage';
+import ChatMessage, { SKILLS_PREVIEW } from './components/ChatMessage';
 import SplashScreen from './components/SplashScreen';
 import ConfigModal from './components/ConfigModal';
 import { supabase, SearchResult, SearchMetrics } from './lib/supabase';
@@ -15,7 +14,6 @@ import {
   type ConversationIntent,
 } from './lib/conversation-context';
 import jsPDF from 'jspdf';
-import html2canvas from 'html2canvas';
 
 interface Message {
   id: string;
@@ -69,6 +67,34 @@ const GREETING_VARIANTS = [
   "Hello! Happy to help with your search. I can filter by almost anything — tech stack, seniority, degrees, clearances, or even patterns like career growth or hands-on experience without a formal title.\n\nWhat kind of candidate do you need?",
 ];
 
+// ── PDF helpers ───────────────────────────────────────────────────────────────
+const hexToRgb = (hex: string): [number, number, number] => {
+  const h = hex.replace('#', '');
+  const n = parseInt(h, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+
+const REASON_BADGE: Record<string, { bg: string; text: string; border: string }> = {
+  degree:     { bg: '#EFF6FF', text: '#1D4ED8', border: '#BFDBFE' },
+  field:      { bg: '#F0FDF4', text: '#15803D', border: '#BBF7D0' },
+  cert:       { bg: '#FFFBEB', text: '#B45309', border: '#FDE68A' },
+  clearance:  { bg: '#FFF1F2', text: '#BE123C', border: '#FECDD3' },
+  experience: { bg: '#F8FAFC', text: '#475569', border: '#CBD5E1' },
+  seniority:  { bg: '#FFF7ED', text: '#C2410C', border: '#FED7AA' },
+  role:       { bg: '#F8FAFC', text: '#475569', border: '#CBD5E1' },
+  institution:{ bg: '#FAF5FF', text: '#7C3AED', border: '#DDD6FE' },
+  skill:      { bg: '#FFF5E6', text: '#E68A00', border: '#FED7AA' },
+  other:      { bg: '#F8FAFC', text: '#64748B', border: '#E2E8F0' },
+};
+
+const INTENT_PDF: Record<string, { label: string; color: string; bg: string }> = {
+  NARROW:  { label: 'Filtered from previous results', color: '#1d4ed8', bg: '#eff6ff' },
+  EXCLUDE: { label: 'Exclusions applied',             color: '#b91c1c', bg: '#fef2f2' },
+  REPLACE: { label: 'Constraints updated',            color: '#b45309', bg: '#fffbeb' },
+  EXPAND:  { label: 'Search expanded',                color: '#15803d', bg: '#f0fdf4' },
+  FORMAT:  { label: 'Results reformatted',            color: '#6b7280', bg: '#f9fafb' },
+};
+
 function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [inputValue, setInputValue] = useState('');
@@ -79,16 +105,29 @@ function App() {
   const [isGeneratingPDF, setIsGeneratingPDF] = useState(false);
   const [showExamples, setShowExamples] = useState(false);
   const [splashDone, setSplashDone] = useState(false);
+  const [expandedSkills, setExpandedSkills] = useState<Set<string>>(new Set());
+  const [snippetCursors, setSnippetCursors] = useState<Record<string, number>>({});
   const handleSplashDone = useCallback(() => setSplashDone(true), []);
-  const messagesContainerRef = useRef<HTMLDivElement>(null);
-  const messageRefs = useRef<Record<string, HTMLDivElement | null>>({});
   const bottomAnchorRef = useRef<HTMLDivElement>(null);
-  // Session context is stored in a ref so it persists across re-renders without
-  // triggering re-renders itself. Updated synchronously after each search turn.
   const sessionCtx = useRef<SessionContext>(createSessionContext());
 
-  // Deliver a bot message. textOnly=true shows typing indicator for 1.5s,
-  // then streams the content letter-by-letter.
+  const handleToggleSkills = useCallback((resultId: string) => {
+    setExpandedSkills(prev => {
+      const next = new Set(prev);
+      if (next.has(resultId)) next.delete(resultId);
+      else next.add(resultId);
+      return next;
+    });
+  }, []);
+
+  const handleShowNextSnippet = useCallback((resultId: string, total: number) => {
+    setSnippetCursors(prev => {
+      const current = prev[resultId] ?? 1;
+      if (current >= total) return { ...prev, [resultId]: 1 };
+      return { ...prev, [resultId]: current + 1 };
+    });
+  }, []);
+
   const postBotMessage = (msg: Message, textOnly = false) => {
     if (textOnly) {
       setIsTyping(true);
@@ -103,7 +142,6 @@ function App() {
 
   useEffect(() => {
     loadConfig();
-    // Show welcome message on first load with typing delay
     const welcomeText = WELCOME_VARIANTS[Math.floor(Math.random() * WELCOME_VARIANTS.length)];
     setIsTyping(true);
     setTimeout(() => {
@@ -117,7 +155,6 @@ function App() {
     }, 1500);
   }, []);
 
-  // Auto-scroll to bottom whenever messages update or indicators appear
   useEffect(() => {
     bottomAnchorRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isTyping, isLoading]);
@@ -128,10 +165,7 @@ function App() {
       .select('*')
       .eq('config_key', 'sharepoint_folder_url')
       .maybeSingle();
-
-    if (data) {
-      setSharePointUrl(data.config_value);
-    }
+    if (data) setSharePointUrl(data.config_value);
   };
 
   // ─── Conversational helpers ────────────────────────────────────────────────
@@ -166,7 +200,6 @@ function App() {
     const skills = (r.skills || []);
     const certs = (r.certifications || []);
 
-    // Extract what they're asking about
     const topicMatch = q.match(/\b(?:have|has|knows?|experienced?|used?|list|mention|background\s+in|done)\s+(?:any\s+)?([a-zA-Z][a-zA-Z\s\+\#\.]{2,40}?)(?:\?|$|\s+(?:experience|background|skills?|certs?))/i);
     const topic = topicMatch?.[1]?.trim();
 
@@ -194,7 +227,6 @@ function App() {
       }
     }
 
-    // Generic candidate question
     return `Here's a quick summary of ${name}:\n\n• **Skills:** ${skills.slice(0, 6).join(', ') || 'none extracted'}\n• **Certifications:** ${certs.slice(0, 4).join(', ') || 'none listed'}\n• **File:** ${r.file_name}\n\nWhat specifically would you like to know about them?`;
   };
 
@@ -218,9 +250,7 @@ function App() {
     if (query.semantic?.promotedInPlace) parts.push('promotion within the same company');
     if (query.experience.excludeVisaSponsorship) parts.push('(excluded: visa sponsorship required)');
     if (query.experience.excludeManagement) parts.push('(excluded: management roles)');
-
     const criteriaStr = parts.length > 0 ? parts.join('; ') : 'broad keyword matching across all resume text';
-
     return `Here's how I selected these ${results.length} candidate${results.length !== 1 ? 's' : ''}:\n\n**Criteria matched:** ${criteriaStr}\n\n**Ranking logic:** Each resume was scored based on keyword frequency, proximity to action verbs (e.g., "built", "deployed", "led"), and whether matches appeared in work experience versus just a skills list. Higher scores rank higher.\n\n**What I did not check:** Employment gaps, contact completeness, or information not present in the resume text itself.\n\nWould you like me to tighten or relax any of these criteria?`;
   };
 
@@ -241,12 +271,9 @@ function App() {
 
     const primaryConstraint = constraints[0];
     let msg = `I couldn't find any candidates who meet ${primaryConstraint}`;
-    if (constraints.length > 1) {
-      msg += ` combined with ${constraints.slice(1).join(' and ')}`;
-    }
+    if (constraints.length > 1) msg += ` combined with ${constraints.slice(1).join(' and ')}`;
     msg += '.';
 
-    // Offer a relaxation
     if (query.degrees.phd) {
       msg += " However, I may be able to find candidates with a Master's degree instead. Would you like to try that?";
     } else if (query.certifications.specific.length > 1) {
@@ -256,7 +283,6 @@ function App() {
     } else {
       msg += " Try broadening the search — I can relax one requirement at a time until we find matches.";
     }
-
     return msg;
   };
 
@@ -265,13 +291,11 @@ function App() {
     const hasCerts = parsedQuery.certifications.specific.length > 0 || parsedQuery.certifications.general.length > 0;
     const hasSeniority = !!parsedQuery.experience.seniority;
     const hasField = !!parsedQuery.degrees.specificField;
-
     const options: string[] = [];
     if (!hasCerts) options.push('a specific certification (e.g., CompTIA A+, AWS, PMP)');
     if (!hasSeniority) options.push('seniority level (entry, mid, or senior)');
     if (!hasField) options.push('a specific field of study');
     if (parsedQuery.skills.required.length < 2) options.push('an additional required skill');
-
     if (options.length === 0) return '';
     return `\n\nWould you like me to narrow this down further? I can filter by ${options.slice(0, 2).join(' or ')}.`;
   };
@@ -291,42 +315,24 @@ function App() {
     setInputValue('');
     setIsLoading(true);
 
-    // ── Greeting ─────────────────────────────────────────────────────────────
     if (isGreeting(query)) {
       const greetingText = GREETING_VARIANTS[Math.floor(Math.random() * GREETING_VARIANTS.length)];
-      postBotMessage({
-        id: (Date.now() + 1).toString(),
-        type: 'bot',
-        content: greetingText,
-        timestamp: new Date(),
-      }, true);
+      postBotMessage({ id: (Date.now() + 1).toString(), type: 'bot', content: greetingText, timestamp: new Date() }, true);
       setIsLoading(false);
       return;
     }
 
-    // ── Candidate Q&A (answer from memory, no DB call) ────────────────────────
     const candidateInContext = isCandidateQuestion(query);
     if (candidateInContext && /\b(does|did|has|have|knows?|mention|list|work|role|title|skill|cert)\b/i.test(query) && /\b(their|him|her|they|the candidate|that person)\b/i.test(query)) {
-      postBotMessage({
-        id: (Date.now() + 1).toString(),
-        type: 'bot',
-        content: buildCandidateAnswer(query, candidateInContext),
-        timestamp: new Date(),
-      }, true);
+      postBotMessage({ id: (Date.now() + 1).toString(), type: 'bot', content: buildCandidateAnswer(query, candidateInContext), timestamp: new Date() }, true);
       setIsLoading(false);
       return;
     }
 
-    // ── Explain results (no DB call) ──────────────────────────────────────────
     const lastPQ = sessionCtx.current.lastParsedQuery;
     const lastRes = sessionCtx.current.lastResults;
     if (isExplainQuery(query) && lastPQ && lastRes && lastRes.length > 0) {
-      postBotMessage({
-        id: (Date.now() + 1).toString(),
-        type: 'bot',
-        content: buildExplanation(lastPQ, lastRes),
-        timestamp: new Date(),
-      }, true);
+      postBotMessage({ id: (Date.now() + 1).toString(), type: 'bot', content: buildExplanation(lastPQ, lastRes), timestamp: new Date() }, true);
       setIsLoading(false);
       return;
     }
@@ -334,18 +340,13 @@ function App() {
     try {
       const startTime = performance.now();
       const ctx = sessionCtx.current;
-
-      // Detect action queries (draft email, summarize, extract links, etc.)
       const actionQuery: ActionQuery | null = detectActionQuery(query);
-
-      // Resolve intent and determine whether to run a global search or operate on previous results
-      const resolved = resolveConversationalTurn(query, ctx, [] /* allResumes placeholder */);
+      const resolved = resolveConversationalTurn(query, ctx, []);
 
       let finalResults: SearchResult[] = [];
       let flaggedUnreadable: SearchResult[] = [];
       let totalResumes = 0;
 
-      // Action queries that reference previous results don't need a new DB search
       const hasPreviousResults = ctx.lastResults && ctx.lastResults.length > 0;
       const actionUsesExisting = actionQuery && hasPreviousResults &&
         /\b(the\s+)?(top\s+\d+|current|above|those|these|them|candidates?|results?|applicants?)\b/i.test(query) &&
@@ -364,7 +365,6 @@ function App() {
         totalResumes = resolved.totalSearched;
       }
 
-      // Sort by cert count if explicitly requested
       if (resolved.parsedQuery?.semantic?.rankByCertCount) {
         finalResults = [...finalResults].sort((a, b) => (b.certifications?.length ?? 0) - (a.certifications?.length ?? 0));
       }
@@ -376,7 +376,6 @@ function App() {
         await supabase.from('search_history').insert({ query, results_count: finalResults.length });
       } catch { /* non-critical */ }
 
-      // Update session context for next turn
       const isNewSearch = resolved.intent === 'NEW' || resolved.intent === 'REPLACE' || resolved.intent === 'EXPAND' || !!actionUsesExisting;
       const newOffset = (resolved as any).newOffset;
       sessionCtx.current = {
@@ -390,7 +389,6 @@ function App() {
         activeFilters: resolved.parsedQuery || ctx.activeFilters,
       };
 
-      // Generate action text if this is an action query
       let actionText: string | undefined;
       let actionTypeLabel: string | undefined;
       if (actionQuery) {
@@ -428,7 +426,6 @@ function App() {
         ...flaggedUnreadable.map((r: any) => ({ ...r, _flaggedUnreadable: true })),
       ];
 
-      // For action queries that produce standalone text output, don't show result cards
       const showCards = !actionQuery || ['flag_ai_generated'].includes(actionQuery.type);
 
       const botMessage: Message = {
@@ -446,34 +443,24 @@ function App() {
         actionType: actionTypeLabel,
       };
 
-      // Text-only messages (no result cards) get the typing delay
       const isTextOnly = !showCards || allResultsCombined.length === 0;
       postBotMessage(botMessage, isTextOnly);
     } catch (error) {
       console.error('Search error:', error);
-      postBotMessage({
-        id: (Date.now() + 1).toString(),
-        type: 'bot',
-        content: 'An error occurred while searching. Please try again.',
-        timestamp: new Date(),
-      }, true);
+      postBotMessage({ id: (Date.now() + 1).toString(), type: 'bot', content: 'An error occurred while searching. Please try again.', timestamp: new Date() }, true);
     } finally {
       setIsLoading(false);
     }
   };
 
-  // Runs a full global search against the database, optionally with a pre-built ParsedQuery
   const runGlobalSearch = async (
     query: string,
     preParsed: import('./lib/nlp-parser').ParsedQuery | null,
     intent: ConversationIntent,
   ): Promise<{ results: SearchResult[]; total: number; flagged: SearchResult[] }> => {
     const { results: dbResults, totalResumes, flaggedUnreadable } = await searchResumes(query, preParsed);
-
-    // If REPLACE/EXPAND, the parsedQuery is already merged — searchResumes will use it
     return { results: dbResults, total: totalResumes, flagged: flaggedUnreadable || [] };
   };
-
 
   const INDUSTRY_EXPANDED: Record<string, string> = {
     'it': 'information technology',
@@ -501,47 +488,29 @@ function App() {
           };
           return { type: 'degree', label: labels[value] || `${value} Degree` };
         }
-        case 'field':
-          return { type: 'field', label: `${value} (Field of Study)` };
-        case 'major':
-          return { type: 'field', label: `Major: ${value}` };
-        case 'cert':
-          return { type: 'cert', label: `${value} Certification` };
-        case 'cert_progress':
-          return { type: 'cert', label: `${value} (In Progress)` };
-        case 'exp':
-          return { type: 'experience', label: `${value}+ Years Experience` };
+        case 'field': return { type: 'field', label: `${value} (Field of Study)` };
+        case 'major': return { type: 'field', label: `Major: ${value}` };
+        case 'cert': return { type: 'cert', label: `${value} Certification` };
+        case 'cert_progress': return { type: 'cert', label: `${value} (In Progress)` };
+        case 'exp': return { type: 'experience', label: `${value}+ Years Experience` };
         case 'seniority': {
           const labels: Record<string, string> = {
-            entry_level: 'Entry Level',
-            mid_level: 'Mid Level',
-            senior: 'Senior Level',
-            staff: 'Staff Level',
-            principal: 'Principal Level',
-            executive: 'Executive Level',
+            entry_level: 'Entry Level', mid_level: 'Mid Level', senior: 'Senior Level',
+            staff: 'Staff Level', principal: 'Principal Level', executive: 'Executive Level',
           };
           return { type: 'seniority', label: labels[value] || `${value.replace('_', ' ')} Level` };
         }
-        case 'company':
-          return { type: 'experience', label: `Worked at ${value}` };
-        case 'role':
-          return { type: 'role', label: `Role: ${value}` };
-        case 'industry':
-          return { type: 'experience', label: `${value} Industry` };
-        case 'institution':
-          return { type: 'institution', label: value === 'Ivy League' ? 'Ivy League Institution' : `Attended ${value}` };
-        case 'clearance':
-          return { type: 'clearance', label: `Security Clearance: ${value}` };
-        case 'employment':
-          return value === 'current'
-            ? { type: 'experience', label: 'Currently Employed' }
-            : { type: 'role', label: `Currently: ${value}` };
-        case 'skill':
-          return { type: 'skill', label: value };
-        case 'other':
-          return { type: 'other', label: value };
-        default:
-          return { type: 'other', label: r };
+        case 'company': return { type: 'experience', label: `Worked at ${value}` };
+        case 'role': return { type: 'role', label: `Role: ${value}` };
+        case 'industry': return { type: 'experience', label: `${value} Industry` };
+        case 'institution': return { type: 'institution', label: value === 'Ivy League' ? 'Ivy League Institution' : `Attended ${value}` };
+        case 'clearance': return { type: 'clearance', label: `Security Clearance: ${value}` };
+        case 'employment': return value === 'current'
+          ? { type: 'experience', label: 'Currently Employed' }
+          : { type: 'role', label: `Currently: ${value}` };
+        case 'skill': return { type: 'skill', label: value };
+        case 'other': return { type: 'other', label: value };
+        default: return { type: 'other', label: r };
       }
     });
   };
@@ -553,9 +522,7 @@ function App() {
       .from('resumes')
       .select(`*, certifications ( certification_name ), skills ( skill_name )`);
 
-    if (!allResumes || allResumes.length === 0) {
-      return { results: [], totalResumes: 0 };
-    }
+    if (!allResumes || allResumes.length === 0) return { results: [], totalResumes: 0 };
 
     const totalResumes = allResumes.length;
     const results: SearchResult[] = [];
@@ -568,16 +535,11 @@ function App() {
 
       const matchResult = matchResumeToQuery(resume.content_text, parsedQuery, resumeMeta);
 
-      // Handle flagUnreadable — collect scanned PDFs as a separate bucket
       if (parsedQuery.skills.flagUnreadable && matchResult.isUnreadable) {
         flaggedUnreadable.push({
-          ...resume,
-          certifications: certNames,
-          skills: skillNames,
+          ...resume, certifications: certNames, skills: skillNames,
           matchedSnippets: ['[Scanned/unreadable PDF — text could not be extracted]'],
-          matchReason: 'Unreadable/scanned resume',
-          exactMatchScore: 0,
-          totalScore: 0,
+          matchReason: 'Unreadable/scanned resume', exactMatchScore: 0, totalScore: 0,
         } as any);
         if (!matchResult.matches) continue;
       }
@@ -585,11 +547,7 @@ function App() {
       if (!matchResult.matches) continue;
 
       const matchedSnippets: string[] = [];
-
-      // If clearance snippet was extracted, use it first
-      if (matchResult.clearanceSnippet) {
-        matchedSnippets.push(matchResult.clearanceSnippet);
-      }
+      if (matchResult.clearanceSnippet) matchedSnippets.push(matchResult.clearanceSnippet);
 
       const findMatchingVariant = (term: string): string => {
         const group = findSynonymGroup(term);
@@ -609,7 +567,6 @@ function App() {
         if (snippet && !matchedSnippets.includes(snippet)) matchedSnippets.push(snippet);
       };
 
-      // Degree terms — search for the actual variant present in the resume
       const degreeTermMap: Record<string, string[]> = {
         bachelor: ['bachelor', 'b.s.', 'bs', 'b.a.', 'ba', 'undergraduate', 'bachelor of science', 'bachelor of arts'],
         master: ['master', 'm.s.', 'ms', 'm.a.', 'ma', 'mba', 'master of science', 'master of arts'],
@@ -621,15 +578,11 @@ function App() {
         if ((parsedQuery.degrees as any)[degKey]) {
           const contentLower = resume.content_text.toLowerCase();
           for (const term of terms) {
-            if (contentLower.includes(term.toLowerCase())) {
-              pushSnippet(term);
-              break;
-            }
+            if (contentLower.includes(term.toLowerCase())) { pushSnippet(term); break; }
           }
         }
       }
 
-      // OR group skills
       if (parsedQuery.skills.orGroups) {
         for (const group of parsedQuery.skills.orGroups) {
           for (const term of group) pushSnippet(term);
@@ -637,20 +590,16 @@ function App() {
       }
 
       if (parsedQuery.degrees.specificField) pushSnippet(parsedQuery.degrees.specificField);
-
       for (const cert of parsedQuery.certifications.general) pushSnippet(cert);
-
       if (parsedQuery.experience.specificRole) pushSnippet(parsedQuery.experience.specificRole);
       if (parsedQuery.experience.currentlyEmployedAs && parsedQuery.experience.currentlyEmployedAs !== '__any__') {
         pushSnippet(parsedQuery.experience.currentlyEmployedAs);
       }
-
       if (parsedQuery.experience.industry) {
         const expanded = INDUSTRY_EXPANDED[parsedQuery.experience.industry] || parsedQuery.experience.industry;
         pushSnippet(expanded);
       }
 
-      // Only push skills that are real technical terms — not degree/cert noise leaked from query
       const degreeNoise = new Set(['bachelors', 'masters', 'bachelor', 'master', 'degree', 'degrees',
         'phd', 'doctorate', 'associates', 'associate', 'diploma', 'graduate', 'undergraduate',
         'certification', 'certifications', 'certified', 'license', 'licenses']);
@@ -663,9 +612,6 @@ function App() {
         if (reason.startsWith('In progress: ')) pushSnippet(reason.slice(13));
       }
 
-      // Fallback: slide a window through the full text looking for the first
-      // clean readable passage. Step by 150 chars so we don't miss content
-      // that sits between sentence boundaries.
       if (matchedSnippets.length === 0) {
         const cleanText = resume.content_text.replace(/\r\n|\r/g, '\n').replace(/\s{3,}/g, '  ');
         const WINDOW = 300;
@@ -673,15 +619,10 @@ function App() {
         for (let pos = 0; pos + WINDOW <= cleanText.length; pos += STEP) {
           const w = cleanText.slice(pos, pos + WINDOW).trim();
           if (w.length < 80) continue;
-          if (!isGibberishSnippet(w)) {
-            matchedSnippets.push(w + (pos + WINDOW < cleanText.length ? '...' : ''));
-            break;
-          }
+          if (!isGibberishSnippet(w)) { matchedSnippets.push(w + (pos + WINDOW < cleanText.length ? '...' : '')); break; }
         }
       }
 
-      // Hard rule: if we still can't produce a clean snippet, this result is unreliable — skip it
-      // Exception: show-all queries include everyone regardless of readability
       const isShowAll = parsedQuery.skills.fields.includes('__all__');
       if (matchedSnippets.length === 0 && !isShowAll) continue;
       if (matchedSnippets.length === 0) matchedSnippets.push('[Resume text could not be extracted]');
@@ -698,7 +639,6 @@ function App() {
       } as any);
     }
 
-    // Sort — top-N by skill if requested, otherwise by total score
     if (parsedQuery.skills.topN && parsedQuery.skills.topNSkill) {
       const rankSkill = parsedQuery.skills.topNSkill;
       results.sort((a: any, b: any) => {
@@ -713,168 +653,95 @@ function App() {
   };
 
   const isGibberishSnippet = (snippet: string): boolean => {
-    // Hard keyword patterns that always mean binary/metadata content
     const gibberishPatterns = [
-      /\d+\s+\d+\s+obj\b/,
-      /\bendobj\b/,
-      /\/Type\s*\//,
-      /endstream/,
-      /xref\s*\n/,
-      /%%EOF/,
-      /\bRoot\s+\d+\s+\d+\s+R\b/,
-      /Content_Types\.xml/,
-      /_rels\/.rels/,
-      /xmlns:/,
-      /\bword\/[a-z]+\d*\.xml\b/,
-      /docProps\//,
-      /\bFont\s+F\d+\s+\d+\s+\d+\s+R\b/,
-      /\bExtGState\s+GS\d+/,
-      /\bProcSet\s*\[PDF/,
-      /\bMediaBox\s+\d/,
-      /\bCropBox\s+\d/,
-      /\bStructParents\b/,
-      /\bCIDFontType\b/,
-      /\bCIDToGIDMap\b/,
-      /\bFontDescriptor\b/,
-      /\bFontFile\d*\b/,
-      /\bFontName\b/,
-      /\bItalicAngle\b/,
-      /\bStemV\b/,
-      /Ordering\s+\(Identity\)/,
-      /Registry\s+\(Adobe\)/,
-      // XMP/RDF metadata
-      /rdf\s+about/i,
-      /pdf\s+Keywords/i,
-      /pdf\s+Producer/i,
-      /Apache\s+FOP/i,
-      // HTTP multipart boundaries
-      /WebKitFormBoundary/,
-      /Content-Disposition\s+form-data/,
-      /Content-Type\s+application/,
-      // Local file paths
-      /file\s+C\s+Users\s+\w+\s+OneDrive/i,
-      /OneDrive\\Documents/i,
-      // URI actions from PDFs
-      /Type\s+Action\s+S\s+URI/,
-      // LinkedIn/social URL noise from DOCX extraction
-      /linkedin\.com\/in\/[a-z0-9\-]+\s+\d{5,}/i,
-      /\d{6,}\s+\d+\s+[a-z0-9\-]+\s+\d+\s+\d+/,
-      // XML self-closing tag leakage
-      /\s*\/>\s*\/>\s*\/>/,
-      // DOCX hyperlink noise: "HYPERLINK https ..."
-      /HYPERLINK\s+https?\s+\S+/i,
+      /\d+\s+\d+\s+obj\b/, /\bendobj\b/, /\/Type\s*\//, /endstream/, /xref\s*\n/, /%%EOF/,
+      /\bRoot\s+\d+\s+\d+\s+R\b/, /Content_Types\.xml/, /_rels\/.rels/, /xmlns:/,
+      /\bword\/[a-z]+\d*\.xml\b/, /docProps\//, /\bFont\s+F\d+\s+\d+\s+\d+\s+R\b/,
+      /\bExtGState\s+GS\d+/, /\bProcSet\s*\[PDF/, /\bMediaBox\s+\d/, /\bCropBox\s+\d/,
+      /\bStructParents\b/, /\bCIDFontType\b/, /\bCIDToGIDMap\b/, /\bFontDescriptor\b/,
+      /\bFontFile\d*\b/, /\bFontName\b/, /\bItalicAngle\b/, /\bStemV\b/,
+      /Ordering\s+\(Identity\)/, /Registry\s+\(Adobe\)/, /rdf\s+about/i, /pdf\s+Keywords/i,
+      /pdf\s+Producer/i, /Apache\s+FOP/i, /WebKitFormBoundary/, /Content-Disposition\s+form-data/,
+      /Content-Type\s+application/, /file\s+C\s+Users\s+\w+\s+OneDrive/i, /OneDrive\\Documents/i,
+      /Type\s+Action\s+S\s+URI/, /linkedin\.com\/in\/[a-z0-9\-]+\s+\d{5,}/i,
+      /\d{6,}\s+\d+\s+[a-z0-9\-]+\s+\d+\s+\d+/, /\s*\/>\s*\/>\s*\/>/, /HYPERLINK\s+https?\s+\S+/i,
     ];
     if (gibberishPatterns.some(p => p.test(snippet))) return true;
-
     const words = snippet.split(/\s+/).filter(w => w.length > 0);
     if (words.length < 5) return true;
-
-    // Reject scrambled character dumps: high ratio of very short tokens
     const shortTokens = words.filter(w => w.length <= 2);
     if (shortTokens.length / words.length > 0.55) return true;
-
-    // Reject if too many purely numeric tokens
     const numericTokens = words.filter(w => /^\d+$/.test(w));
     if (numericTokens.length / words.length > 0.25) return true;
-
-    // Reject XML tag leakage: too many /> tokens
     const xmlTags = (snippet.match(/\/>/g) || []).length;
     if (xmlTags >= 2) return true;
-
-    // Must have at least 4 real English words (4+ consecutive letters)
     const realWords = words.filter(w => /^[a-zA-Z]{4,}$/.test(w));
     if (realWords.length < 4) return true;
-
-    // Average token length below 3 = scrambled/spaced-out chars
     const avgLen = words.reduce((sum, w) => sum + w.length, 0) / words.length;
     if (avgLen < 3.0) return true;
-
-    // Reject binary/compressed content: high ratio of non-alphanumeric chars
-    // e.g. "x Mvh' HH7< u1~y *qCK +`e@ %2Mf kI-{"
     const nonAlphanumeric = (snippet.match(/[^a-zA-Z0-9\s.,;:'"()\-]/g) || []).length;
     if (nonAlphanumeric / snippet.length > 0.12) return true;
-
     return false;
   };
 
-  // Build a clean sentence-anchored snippet around a specific position in text.
   const buildSnippetAt = (text: string, index: number, keywordLen: number): string => {
     const CONTEXT = 250;
     const rawStart = Math.max(0, index - CONTEXT);
     const rawEnd = Math.min(text.length, index + keywordLen + CONTEXT);
     const windowText = text.slice(rawStart, rawEnd);
-
     const keywordPosInWindow = index - rawStart;
     const beforeKeyword = windowText.slice(0, keywordPosInWindow);
     const afterKeyword = windowText.slice(keywordPosInWindow + keywordLen);
-
     const sentenceStartMatch = beforeKeyword.match(/(?:^|[.!?\n])\s*([^.!?\n]{10,})$/);
     const cleanBefore = sentenceStartMatch
       ? sentenceStartMatch[1]
       : beforeKeyword.slice(Math.max(0, beforeKeyword.length - 140));
-
     const sentenceEndMatch = afterKeyword.match(/^([^.!?\n]*[.!?])/);
-    const cleanAfter = sentenceEndMatch
-      ? sentenceEndMatch[1]
-      : afterKeyword.slice(0, 140);
-
+    const cleanAfter = sentenceEndMatch ? sentenceEndMatch[1] : afterKeyword.slice(0, 140);
     const snippet = (cleanBefore + windowText.slice(keywordPosInWindow, keywordPosInWindow + keywordLen) + cleanAfter).trim();
-
     if (isGibberishSnippet(snippet) || snippet.length < 20) return '';
-
     const addLeadingEllipsis = rawStart > 0 && !sentenceStartMatch;
     const addTrailingEllipsis = rawEnd < text.length && !sentenceEndMatch;
     return (addLeadingEllipsis ? '...' : '') + snippet + (addTrailingEllipsis ? '...' : '');
   };
 
-  // Extract a clean snippet around a keyword, trying every occurrence until one is clean.
   const extractSnippet = (text: string, keyword: string): string => {
     if (!keyword || keyword.trim().length < 3) return '';
-
     const lowerText = text.toLowerCase();
     const lowerKeyword = keyword.toLowerCase();
-
-    // Try each occurrence of the keyword — first match is often in PDF metadata garbage
     let searchFrom = 0;
     while (searchFrom < lowerText.length) {
       const index = lowerText.indexOf(lowerKeyword, searchFrom);
       if (index === -1) break;
-
       const snippet = buildSnippetAt(text, index, keyword.length);
       if (snippet) return snippet;
-
       searchFrom = index + 1;
     }
     return '';
   };
 
-  const handleExampleClick = (prompt: string) => {
-    setInputValue(prompt);
-  };
+  const handleExampleClick = (prompt: string) => setInputValue(prompt);
 
   const loadMoreResults = (messageId: string) => {
     setMessages((prevMessages) =>
       prevMessages.map((msg) => {
         if (msg.id === messageId && msg.allResults) {
           const newDisplayCount = (msg.displayCount || 10) + 10;
-          return {
-            ...msg,
-            results: msg.allResults.slice(0, newDisplayCount),
-            displayCount: newDisplayCount,
-          };
+          return { ...msg, results: msg.allResults.slice(0, newDisplayCount), displayCount: newDisplayCount };
         }
         return msg;
       })
     );
   };
 
+  // ── PDF Download — pure jsPDF, near-instant ───────────────────────────────
   const handleDownloadPDF = async () => {
     if (messages.length === 0) {
       alert('No conversation to download yet. Start chatting with the Resume Manager first!');
       return;
     }
-
     setIsGeneratingPDF(true);
+    await new Promise(r => setTimeout(r, 30));
 
     try {
       const now = new Date();
@@ -884,140 +751,505 @@ function App() {
       const pdf = new jsPDF('p', 'mm', 'a4');
       const PAGE_W = 210;
       const PAGE_H = 297;
+      const MARGIN = 10;
+      const CONTENT_W = PAGE_W - MARGIN * 2;
       const FOOTER_H = 10;
-      const MARGIN_TOP = 6;
-      const MARGIN_SIDE = 8;
-      const CONTENT_W = PAGE_W - MARGIN_SIDE * 2;
-      const USABLE_H = PAGE_H - FOOTER_H - MARGIN_TOP;
-      const GAP = 2.5; // mm between items
+      const USABLE_H = PAGE_H - FOOTER_H - 4;
 
-      const h2cOpts = { scale: 2, useCORS: true, logging: false } as Parameters<typeof html2canvas>[1];
+      // Fetch logo
+      let logoDataUrl: string | null = null;
+      let logoAspect = 3.0;
+      try {
+        const resp = await fetch('https://raw.githubusercontent.com/Allanelh/Humango-Hiring-Manager-Assets/main/image%20(1).png');
+        const blob = await resp.blob();
+        logoDataUrl = await new Promise<string>(resolve => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result as string);
+          reader.readAsDataURL(blob);
+        });
+        const img = new Image();
+        img.src = logoDataUrl;
+        await new Promise<void>(r => { img.onload = () => r(); img.onerror = () => r(); });
+        if (img.naturalWidth && img.naturalHeight) logoAspect = img.naturalWidth / img.naturalHeight;
+      } catch { /* proceed without logo */ }
 
-      // ── HEADER ──────────────────────────────────────────────────────────
-      const HEADER_W = Math.round(CONTENT_W / PAGE_W * 860);
-      const headerEl = document.createElement('div');
-      headerEl.style.cssText = `position:absolute;left:-9999px;width:${HEADER_W}px;background:#ffffff;`;
-      headerEl.innerHTML = `
-        <div style="background:#027B7B;padding:22px 32px;display:flex;align-items:center;justify-content:space-between;border-radius:6px 6px 0 0;">
-          <div>
-            <div style="font-size:11px;font-weight:700;color:#FE9900;letter-spacing:3px;text-transform:uppercase;margin-bottom:3px;">Humango Solutions</div>
-            <div style="font-size:26px;font-weight:700;color:#ffffff;letter-spacing:1px;line-height:1;">RESUME MANAGER</div>
-            <div style="font-size:12px;color:#cceaea;letter-spacing:2px;text-transform:uppercase;margin-top:3px;">Candidate Search Report</div>
-          </div>
-          <img src="https://raw.githubusercontent.com/Allanelh/Humango-Hiring-Manager-Assets/main/image%20(1).png" alt="logo" style="height:96px;width:auto;margin-left:auto;" crossorigin="anonymous" />
-        </div>
-        <div style="background:#f7f7f7;padding:10px 32px;display:flex;gap:32px;border-bottom:1px solid #e0e0e0;">
-          <div><div style="font-size:9px;font-weight:700;color:#888;letter-spacing:1.5px;text-transform:uppercase;">Date Issued</div><div style="font-size:12px;font-weight:600;color:#222;">${dateStr}</div></div>
-          <div><div style="font-size:9px;font-weight:700;color:#888;letter-spacing:1.5px;text-transform:uppercase;">Time</div><div style="font-size:12px;font-weight:600;color:#222;">${timeStr}</div></div>
-          <div><div style="font-size:9px;font-weight:700;color:#888;letter-spacing:1.5px;text-transform:uppercase;">Total Exchanges</div><div style="font-size:12px;font-weight:600;color:#222;">${messages.length}</div></div>
-        </div>
-      `;
-      document.body.appendChild(headerEl);
-      const headerCanvas = await html2canvas(headerEl, { ...h2cOpts, backgroundColor: '#ffffff', useCORS: true, allowTaint: false });
-      document.body.removeChild(headerEl);
+      // ── HEADER ──────────────────────────────────────────────────────────────
+      const HDR_H = 28;
+      const META_H = 14;
 
-      const headerH = (headerCanvas.height * CONTENT_W) / headerCanvas.width;
-      pdf.addImage(headerCanvas.toDataURL('image/png'), 'PNG', MARGIN_SIDE, MARGIN_TOP, CONTENT_W, headerH);
-      let cursorY = MARGIN_TOP + headerH + GAP;
+      pdf.setFillColor(2, 123, 123);
+      pdf.rect(MARGIN, 6, CONTENT_W, HDR_H, 'F');
+
+      pdf.setFont('helvetica', 'bold');
+      pdf.setFontSize(7);
+      pdf.setTextColor(254, 153, 0);
+      pdf.text('HUMANGO SOLUTIONS', MARGIN + 8, 6 + 8);
+
+      pdf.setFontSize(18);
+      pdf.setTextColor(255, 255, 255);
+      pdf.text('RESUME MANAGER', MARGIN + 8, 6 + 17.5);
+
+      pdf.setFont('helvetica', 'normal');
+      pdf.setFontSize(8);
+      pdf.setTextColor(204, 234, 234);
+      pdf.text('Candidate Search Report', MARGIN + 8, 6 + 24);
+
+      if (logoDataUrl) {
+        const logoH = (HDR_H - 4) * 1.14;
+        const logoW = logoH * logoAspect;
+        const logoX = MARGIN + CONTENT_W - logoW - 4;
+        const logoY = 6 + (HDR_H - logoH) / 2;
+        pdf.addImage(logoDataUrl, 'PNG', logoX, logoY, logoW, logoH);
+      }
+
+      // Meta bar
+      pdf.setFillColor(247, 247, 247);
+      pdf.rect(MARGIN, 6 + HDR_H, CONTENT_W, META_H, 'F');
+      pdf.setDrawColor(224, 224, 224);
+      pdf.setLineWidth(0.3);
+      pdf.line(MARGIN, 6 + HDR_H + META_H, MARGIN + CONTENT_W, 6 + HDR_H + META_H);
+
+      const metaItems = [
+        { label: 'DATE ISSUED', value: dateStr },
+        { label: 'TIME', value: timeStr },
+        { label: 'TOTAL EXCHANGES', value: String(messages.length) },
+      ];
+      let metaX = MARGIN + 8;
+      for (const item of metaItems) {
+        pdf.setFont('helvetica', 'bold');
+        pdf.setFontSize(6);
+        pdf.setTextColor(136, 136, 136);
+        pdf.text(item.label, metaX, 6 + HDR_H + 5);
+        pdf.setFontSize(9);
+        pdf.setTextColor(34, 34, 34);
+        pdf.text(item.value, metaX, 6 + HDR_H + 11);
+        metaX += 58;
+      }
+
+      let cursorY = 6 + HDR_H + META_H + 4;
       let currentPage = 1;
 
-      // ── FOOTER HELPER ────────────────────────────────────────────────────
+      // ── FOOTER ──────────────────────────────────────────────────────────────
       const drawFooter = (pageNum: number, totalPages: number) => {
         const fy = PAGE_H - FOOTER_H;
         pdf.setFillColor(255, 255, 255);
         pdf.rect(0, fy, PAGE_W, FOOTER_H, 'F');
         pdf.setDrawColor(220, 220, 220);
         pdf.setLineWidth(0.3);
-        pdf.line(MARGIN_SIDE, fy + 0.5, PAGE_W - MARGIN_SIDE, fy + 0.5);
+        pdf.line(MARGIN, fy + 0.5, PAGE_W - MARGIN, fy + 0.5);
         pdf.setFont('helvetica', 'normal');
         pdf.setFontSize(7);
         pdf.setTextColor(180, 180, 180);
-        pdf.text(`${dateStr}  ${timeStr}`, MARGIN_SIDE, fy + 6.5);
+        pdf.text(`${dateStr}  ${timeStr}`, MARGIN, fy + 6.5);
         pdf.text('Confidential Information \u2013 Humango Solutions LLC', PAGE_W / 2, fy + 6.5, { align: 'center' });
-        pdf.text(`Page ${pageNum} of ${totalPages}`, PAGE_W - MARGIN_SIDE, fy + 6.5, { align: 'right' });
+        pdf.text(`Page ${pageNum} of ${totalPages}`, PAGE_W - MARGIN, fy + 6.5, { align: 'right' });
       };
 
-      // ── PLACEMENT HELPER ─────────────────────────────────────────────────
-      const place = (canvas: HTMLCanvasElement) => {
-        const imgH = (canvas.height * CONTENT_W) / canvas.width;
-        if (cursorY + imgH > USABLE_H) {
+      const checkPage = (neededH: number) => {
+        if (cursorY + neededH > USABLE_H) {
           currentPage++;
           pdf.addPage();
-          cursorY = MARGIN_TOP;
+          cursorY = 8;
         }
-        pdf.addImage(canvas.toDataURL('image/png'), 'PNG', MARGIN_SIDE, cursorY, CONTENT_W, imgH);
-        cursorY += imgH + GAP;
       };
 
-      // ── CAPTURE ALL PIECES FIRST (DOM is live and stable) ───────────────
-      // All pieces must be captured at the same reference pixel width so that
-      // text scales consistently when every canvas is stretched to CONTENT_W mm.
-      const pieces: HTMLCanvasElement[] = [];
+      // Layout constants
+      const GAP = 3;
+      const ICON_R = 4;
+      const ICON_D = ICON_R * 2;
+      const BUBBLE_PAD_X = 3.5;
+      const BUBBLE_PAD_Y = 2.5;
+      const LINE_H = 4.2;
+      const FONT_SIZE = 9;
+      const MAX_BUBBLE_W = CONTENT_W * 0.75;
+      const SNIP_LINE_H = 4.2;
+      const SNIP_PAD_TOP = 3.5;
+      const SNIP_PAD_BOT = 4.0;
+      const CARD_PAD = 4;
 
-      // Helper: wrap an element clone in a fixed-width container and capture it.
-      const captureAtWidth = async (source: Element, refWidth: number): Promise<HTMLCanvasElement> => {
-        const wrapper = document.createElement('div');
-        wrapper.style.cssText = `position:absolute;left:-9999px;top:0;width:${refWidth}px;background:#ffffff;`;
-        const clone = source.cloneNode(true) as HTMLElement;
-        // Remove any absolute/fixed positioning on the clone itself
-        clone.style.position = 'relative';
-        clone.style.left = '0';
-        clone.style.top = '0';
-        clone.style.width = '100%';
-        wrapper.appendChild(clone);
-        document.body.appendChild(wrapper);
-        const c = await html2canvas(wrapper, { ...h2cOpts, backgroundColor: '#ffffff' });
-        document.body.removeChild(wrapper);
-        return c;
+      const toTitleCase = (s: string) => s.replace(/\b\w/g, c => c.toUpperCase());
+
+      // ── ICONS ────────────────────────────────────────────────────────────────
+      const drawUserIcon = (cx: number, cy: number) => {
+        pdf.setFillColor(51, 65, 85);
+        pdf.circle(cx, cy, ICON_R, 'F');
+        pdf.setFillColor(255, 255, 255);
+        pdf.circle(cx, cy - 1.5, 2.0, 'F');
+        pdf.setFillColor(255, 255, 255);
+        pdf.ellipse(cx, cy + 2.5, 3.0, 1.6, 'F');
       };
 
+      const drawBotIcon = (cx: number, cy: number) => {
+        pdf.setFillColor(254, 153, 0);
+        pdf.circle(cx, cy, ICON_R, 'F');
+        pdf.setFillColor(255, 255, 255);
+        pdf.roundedRect(cx - 2.5, cy - 2.0, 5.0, 4.0, 0.5, 0.5, 'F');
+        pdf.setFillColor(254, 153, 0);
+        pdf.rect(cx - 1.8, cy - 1.2, 1.2, 1.0, 'F');
+        pdf.rect(cx + 0.6, cy - 1.2, 1.2, 1.0, 'F');
+        pdf.rect(cx - 1.5, cy + 0.8, 3.0, 0.7, 'F');
+        pdf.setDrawColor(255, 255, 255);
+        pdf.setLineWidth(0.4);
+        pdf.line(cx, cy - 2.0, cx, cy - 3.5);
+        pdf.setFillColor(255, 255, 255);
+        pdf.circle(cx, cy - 3.7, 0.4, 'F');
+      };
+
+      // ── RENDER CHIP ROW — returns actual height used ─────────────────────────
+      const renderChipRow = (
+        items: string[],
+        startX: number,
+        startY: number,
+        maxW: number,
+        chipH: number,
+        chipPad: number,
+        bgColor: [number, number, number],
+        borderColor: [number, number, number],
+        textColor: [number, number, number],
+        fontSize: number,
+      ): number => {
+        let sx = startX;
+        let sy = startY;
+        for (const item of items) {
+          const label = toTitleCase(item);
+          pdf.setFontSize(fontSize);
+          const chipW = pdf.getTextWidth(label) + chipPad * 2;
+          if (sx + chipW > startX + maxW) { sx = startX; sy += chipH + 1.5; }
+          pdf.setFillColor(...bgColor);
+          pdf.setDrawColor(...borderColor);
+          pdf.setLineWidth(0.3);
+          pdf.roundedRect(sx, sy, chipW, chipH, 1, 1, 'FD');
+          pdf.setFont('helvetica', 'normal');
+          pdf.setFontSize(fontSize);
+          pdf.setTextColor(...textColor);
+          pdf.text(label, sx + chipPad, sy + chipH - 1.5);
+          sx += chipW + 1.5;
+        }
+        return sy + chipH - startY;
+      };
+
+      // Measure chip rows without drawing
+      const measureChipRows = (
+        items: string[],
+        maxW: number,
+        chipH: number,
+        chipPad: number,
+        fontSize: number,
+      ): number => {
+        let sx = 0;
+        let rows = 1;
+        for (const item of items) {
+          pdf.setFontSize(fontSize);
+          const chipW = pdf.getTextWidth(toTitleCase(item)) + chipPad * 2;
+          if (sx + chipW > maxW) { sx = 0; rows++; }
+          sx += chipW + 1.5;
+        }
+        return rows * (chipH + 1.5) - 1.5;
+      };
+
+      // Measure badge rows without drawing
+      const measureBadgeRows = (
+        reasons: Array<{ type: string; label: string }>,
+        maxW: number,
+        badgeH: number,
+        badgePad: number,
+      ): number => {
+        let bx = 0;
+        let rows = 1;
+        for (const r of reasons) {
+          pdf.setFontSize(6);
+          const badgeW = pdf.getTextWidth(toTitleCase(r.label)) + badgePad * 2 + 3;
+          if (bx + badgeW > maxW) { bx = 0; rows++; }
+          bx += badgeW + 1.5;
+        }
+        return rows * (badgeH + 1.5) - 1.5;
+      };
+
+      // ── MESSAGES ─────────────────────────────────────────────────────────────
       for (const msg of messages) {
-        const el = messageRefs.current[msg.id];
-        if (!el) continue;
+        const isUser = msg.type === 'user';
 
-        // Capture at 85% of natural width → scales up ~18% in PDF (≈ one font size larger)
-        const refWidth = Math.round(el.getBoundingClientRect().width * 0.85);
-        const resultsContainer = el.querySelector('[data-pdf-results]') as HTMLElement | null;
-        const resultCards = el.querySelectorAll('[data-pdf-result-card]');
+        if (isUser) {
+          pdf.setFont('helvetica', 'normal');
+          pdf.setFontSize(FONT_SIZE);
+          const maxTextW = MAX_BUBBLE_W - BUBBLE_PAD_X * 2;
+          const lines = pdf.splitTextToSize(msg.content, maxTextW) as string[];
 
-        if (!resultsContainer || resultCards.length === 0) {
-          // User message or bot message with no result cards
-          const c = await captureAtWidth(el, refWidth);
-          pieces.push(c);
+          let maxLineW = 0;
+          for (const line of lines) {
+            pdf.setFontSize(FONT_SIZE);
+            const w = pdf.getTextWidth(line);
+            if (w > maxLineW) maxLineW = w;
+          }
+          const bubbleW = Math.min(maxLineW + BUBBLE_PAD_X * 2, MAX_BUBBLE_W);
+          const bubbleH = lines.length * LINE_H * 0.85 + BUBBLE_PAD_Y * 2;
+
+          checkPage(Math.max(bubbleH, ICON_D) + GAP);
+
+          const iconCx = MARGIN + CONTENT_W - ICON_R;
+          const iconCy = cursorY + ICON_R;
+          drawUserIcon(iconCx, iconCy);
+
+          const bubbleX = MARGIN + CONTENT_W - ICON_D - 2 - bubbleW;
+          pdf.setFillColor(254, 153, 0);
+          pdf.roundedRect(bubbleX, cursorY, bubbleW, bubbleH, 2, 2, 'F');
+
+          pdf.setFont('helvetica', 'normal');
+          pdf.setFontSize(FONT_SIZE);
+          pdf.setTextColor(255, 255, 255);
+          pdf.text(lines, bubbleX + BUBBLE_PAD_X, cursorY + BUBBLE_PAD_Y + FONT_SIZE * 0.3528, { lineHeightFactor: LINE_H * 0.85 / (FONT_SIZE * 0.3528) });
+
+          cursorY += Math.max(bubbleH, ICON_D) + GAP;
+
         } else {
-          // Bot message with result cards:
-          // 1. Clone the full message, remove the results container → message header only
-          const headerClone = el.cloneNode(true) as HTMLElement;
-          const cloneResults = headerClone.querySelector('[data-pdf-results]');
-          if (cloneResults) cloneResults.remove();
-          const headerWrapper = document.createElement('div');
-          headerWrapper.style.cssText = `position:absolute;left:-9999px;top:0;width:${refWidth}px;background:#ffffff;`;
-          headerClone.style.position = 'relative';
-          headerClone.style.left = '0';
-          headerClone.style.top = '0';
-          headerClone.style.width = '100%';
-          headerWrapper.appendChild(headerClone);
-          document.body.appendChild(headerWrapper);
-          const headerC = await html2canvas(headerWrapper, { ...h2cOpts, backgroundColor: '#ffffff' });
-          document.body.removeChild(headerWrapper);
-          pieces.push(headerC);
+          // Bot message
+          const iconCx = MARGIN + ICON_R;
+          const botBubbleX = MARGIN + ICON_D + 2;
+          const botBubbleW = CONTENT_W - ICON_D - 2;
+          const maxBotTextW = botBubbleW - BUBBLE_PAD_X * 2;
 
-          // 2. Each result card wrapped at the same refWidth for consistent scale
-          for (const card of Array.from(resultCards)) {
-            const c = await captureAtWidth(card, refWidth);
-            pieces.push(c);
+          // Intent banner
+          const intentCfg = msg.intentType && msg.intentType !== 'NEW' ? INTENT_PDF[msg.intentType] : null;
+          if (intentCfg) {
+            const intentH = 7;
+            checkPage(intentH + 1);
+            const [bgR, bgG, bgB] = hexToRgb(intentCfg.bg);
+            const [txR, txG, txB] = hexToRgb(intentCfg.color);
+            pdf.setFillColor(bgR, bgG, bgB);
+            pdf.rect(botBubbleX, cursorY, botBubbleW, intentH, 'F');
+            pdf.setFillColor(...hexToRgb(intentCfg.color));
+            pdf.rect(botBubbleX, cursorY, 1.5, intentH, 'F');
+            pdf.setFont('helvetica', 'bold');
+            pdf.setFontSize(7);
+            pdf.setTextColor(txR, txG, txB);
+            pdf.text(msg.intentLabel || intentCfg.label, botBubbleX + 5, cursorY + 4.5);
+            cursorY += intentH + 0.5;
+          }
+
+          pdf.setFont('helvetica', 'normal');
+          pdf.setFontSize(FONT_SIZE);
+          const botLines = pdf.splitTextToSize(msg.content, maxBotTextW) as string[];
+          const metricsH = msg.metrics ? 6 : 0;
+          const bubbleH = botLines.length * LINE_H + BUBBLE_PAD_Y * 2 + metricsH;
+
+          checkPage(Math.max(bubbleH, ICON_D) + GAP);
+          drawBotIcon(iconCx, cursorY + ICON_R);
+
+          pdf.setFillColor(241, 245, 249);
+          pdf.roundedRect(botBubbleX, cursorY, botBubbleW, bubbleH, 2, 2, 'F');
+
+          pdf.setFont('helvetica', 'normal');
+          pdf.setFontSize(FONT_SIZE);
+          pdf.setTextColor(30, 41, 59);
+          pdf.text(botLines, botBubbleX + BUBBLE_PAD_X, cursorY + BUBBLE_PAD_Y + FONT_SIZE * 0.3528, { lineHeightFactor: LINE_H / (FONT_SIZE * 0.3528) });
+
+          if (msg.metrics) {
+            const metY = cursorY + bubbleH - metricsH;
+            pdf.setDrawColor(148, 163, 184);
+            pdf.setLineWidth(0.2);
+            pdf.line(botBubbleX + 2, metY, botBubbleX + botBubbleW - 2, metY);
+            pdf.setFont('helvetica', 'normal');
+            pdf.setFontSize(6);
+            pdf.setTextColor(148, 163, 184);
+            pdf.text(`Searched ${msg.metrics.totalResumes} resume${msg.metrics.totalResumes !== 1 ? 's' : ''} in ${msg.metrics.searchTimeSeconds}s`, botBubbleX + BUBBLE_PAD_X, metY + 4);
+          }
+
+          cursorY += bubbleH + GAP;
+
+          // Action text block
+          if (msg.actionText) {
+            const actionTextW = botBubbleW - 8;
+            pdf.setFont('helvetica', 'normal');
+            pdf.setFontSize(8);
+            const actionLines = pdf.splitTextToSize(msg.actionText, actionTextW) as string[];
+            const headerH = msg.actionType ? 6 : 0;
+            const actionH = actionLines.length * 3.8 + headerH + 8;
+            checkPage(actionH);
+
+            pdf.setFillColor(255, 255, 255);
+            pdf.setDrawColor(226, 232, 240);
+            pdf.setLineWidth(0.3);
+            pdf.roundedRect(botBubbleX, cursorY, botBubbleW, actionH, 2, 2, 'FD');
+
+            if (msg.actionType) {
+              pdf.setFillColor(249, 250, 251);
+              pdf.rect(botBubbleX, cursorY, botBubbleW, headerH, 'F');
+              pdf.setFont('helvetica', 'bold');
+              pdf.setFontSize(6);
+              pdf.setTextColor(100, 116, 139);
+              pdf.text(msg.actionType.toUpperCase(), botBubbleX + 4, cursorY + 4);
+            }
+            pdf.setFont('helvetica', 'normal');
+            pdf.setFontSize(8);
+            pdf.setTextColor(71, 85, 105);
+            pdf.text(actionLines, botBubbleX + 4, cursorY + headerH + 5, { lineHeightFactor: 3.8 / (8 * 0.3528) });
+            cursorY += actionH + GAP;
+          }
+
+          // Result cards
+          if (msg.results && msg.results.length > 0) {
+            for (const result of msg.results) {
+              const isUnreadable = (result as any)._flaggedUnreadable;
+              const CARD_W = botBubbleW;
+              const CARD_X = botBubbleX;
+              const maxChipW = CARD_W - CARD_PAD * 2;
+              const reasons = result.matchReasons || [];
+
+              const skillsToShow = expandedSkills.has(result.id)
+                ? (result.skills || [])
+                : (result.skills || []).slice(0, SKILLS_PREVIEW);
+              const visibleSnippetCount = snippetCursors[result.id] ?? 1;
+              const visibleSnippets = (result.matchedSnippets || []).slice(0, visibleSnippetCount);
+
+              // Pre-measure card height
+              let cardContentH = CARD_PAD * 2;
+              if (isUnreadable) cardContentH += 9;
+              cardContentH += 8; // name
+
+              if (reasons.length > 0) {
+                cardContentH += measureBadgeRows(reasons, maxChipW, 5, 2.5) + 3;
+              }
+              if (skillsToShow.length > 0) {
+                cardContentH += 6 + measureChipRows(skillsToShow, maxChipW, 5.5, 2.5, 6.5) + 3;
+              }
+              if (result.certifications && result.certifications.length > 0) {
+                cardContentH += 6 + measureChipRows(result.certifications, maxChipW, 5.5, 2.5, 6.5) + 3;
+              }
+              if (visibleSnippets.length > 0) {
+                cardContentH += 7;
+                const snipW = CARD_W - CARD_PAD * 2 - 4;
+                for (const snippet of visibleSnippets) {
+                  pdf.setFontSize(7);
+                  const snipLines = pdf.splitTextToSize(snippet, snipW) as string[];
+                  cardContentH += snipLines.length * SNIP_LINE_H + SNIP_PAD_TOP + SNIP_PAD_BOT + 2;
+                }
+              }
+
+              checkPage(cardContentH);
+
+              // Card background
+              pdf.setFillColor(isUnreadable ? 255 : 255, isUnreadable ? 251 : 255, isUnreadable ? 235 : 255);
+              pdf.setDrawColor(isUnreadable ? 217 : 226, isUnreadable ? 183 : 232, isUnreadable ? 74 : 240);
+              pdf.setLineWidth(0.4);
+              pdf.roundedRect(CARD_X, cursorY, CARD_W, cardContentH, 2, 2, 'FD');
+
+              let gy = cursorY + CARD_PAD;
+
+              // Unreadable warning
+              if (isUnreadable) {
+                pdf.setFont('helvetica', 'bold');
+                pdf.setFontSize(7);
+                pdf.setTextColor(180, 83, 9);
+                pdf.text('! Scanned / Unreadable PDF — requires manual review', CARD_X + CARD_PAD, gy + 3.5);
+                gy += 7;
+                pdf.setDrawColor(253, 230, 138);
+                pdf.setLineWidth(0.3);
+                pdf.line(CARD_X + CARD_PAD, gy, CARD_X + CARD_W - CARD_PAD, gy);
+                gy += 2;
+              }
+
+              // Candidate name
+              pdf.setFont('helvetica', 'bold');
+              pdf.setFontSize(10);
+              pdf.setTextColor(15, 23, 42);
+              pdf.text(result.candidate_name || result.file_name, CARD_X + CARD_PAD + 4, gy + 5.5);
+              gy += 8;
+
+              // Match reason badges
+              if (reasons.length > 0) {
+                const BADGE_H = 5;
+                const BADGE_PAD = 2.5;
+                let bx = CARD_X + CARD_PAD;
+                let by = gy;
+                for (const reason of reasons) {
+                  const cfg = REASON_BADGE[reason.type] || REASON_BADGE.other;
+                  const label = toTitleCase(reason.label);
+                  pdf.setFontSize(6);
+                  const badgeW = pdf.getTextWidth(label) + BADGE_PAD * 2 + 3;
+                  if (bx + badgeW > CARD_X + CARD_W - CARD_PAD) { bx = CARD_X + CARD_PAD; by += BADGE_H + 1.5; }
+                  const [bgR, bgG, bgB] = hexToRgb(cfg.bg);
+                  const [txR, txG, txB] = hexToRgb(cfg.text);
+                  const [bdR, bdG, bdB] = hexToRgb(cfg.border);
+                  pdf.setFillColor(bgR, bgG, bgB);
+                  pdf.setDrawColor(bdR, bdG, bdB);
+                  pdf.setLineWidth(0.3);
+                  pdf.roundedRect(bx, by, badgeW, BADGE_H, 1, 1, 'FD');
+                  pdf.setFont('helvetica', 'bold');
+                  pdf.setFontSize(6);
+                  pdf.setTextColor(txR, txG, txB);
+                  pdf.text(label, bx + BADGE_PAD + 1, by + BADGE_H - 1.3);
+                  bx += badgeW + 1.5;
+                }
+                gy = by + BADGE_H + 3;
+              }
+
+              // Skills chips
+              if (skillsToShow.length > 0) {
+                pdf.setFont('helvetica', 'bold');
+                pdf.setFontSize(7.5);
+                pdf.setTextColor(71, 85, 105);
+                pdf.text('Skills:', CARD_X + CARD_PAD, gy + 4);
+                gy += 6;
+                const usedH = renderChipRow(
+                  skillsToShow, CARD_X + CARD_PAD, gy, maxChipW,
+                  5.5, 2.5, [255, 245, 230], [254, 215, 170], [230, 138, 0], 6.5
+                );
+                gy += usedH + 3;
+              }
+
+              // Certification chips
+              if (result.certifications && result.certifications.length > 0) {
+                pdf.setFont('helvetica', 'bold');
+                pdf.setFontSize(7.5);
+                pdf.setTextColor(71, 85, 105);
+                pdf.text('Certifications:', CARD_X + CARD_PAD, gy + 4);
+                gy += 6;
+                const usedH = renderChipRow(
+                  result.certifications, CARD_X + CARD_PAD, gy, maxChipW,
+                  5.5, 2.5, [255, 251, 235], [253, 230, 138], [180, 83, 9], 6.5
+                );
+                gy += usedH + 3;
+              }
+
+              // Excerpt boxes
+              if (visibleSnippets.length > 0) {
+                pdf.setFont('helvetica', 'bold');
+                pdf.setFontSize(7.5);
+                pdf.setTextColor(71, 85, 105);
+                pdf.text('Relevant Excerpts:', CARD_X + CARD_PAD, gy + 4);
+                gy += 7;
+
+                for (const snippet of visibleSnippets) {
+                  pdf.setFontSize(7);
+                  const snipW = CARD_W - CARD_PAD * 2 - 4;
+                  const snipLines = pdf.splitTextToSize(snippet, snipW) as string[];
+                  const snipBoxH = snipLines.length * SNIP_LINE_H + SNIP_PAD_TOP + SNIP_PAD_BOT;
+
+                  pdf.setFillColor(248, 250, 252);
+                  pdf.setDrawColor(226, 232, 240);
+                  pdf.setLineWidth(0.3);
+                  pdf.roundedRect(CARD_X + CARD_PAD, gy, snipW + 4, snipBoxH, 1, 1, 'FD');
+                  pdf.setFillColor(2, 123, 123);
+                  pdf.rect(CARD_X + CARD_PAD, gy, 1.5, snipBoxH, 'F');
+
+                  pdf.setFont('helvetica', 'italic');
+                  pdf.setFontSize(7);
+                  pdf.setTextColor(100, 116, 139);
+                  pdf.text(snipLines, CARD_X + CARD_PAD + 4, gy + SNIP_PAD_TOP + 2.5, {
+                    lineHeightFactor: SNIP_LINE_H / (7 * 0.3528),
+                  });
+                  gy += snipBoxH + 2;
+                }
+              }
+
+              cursorY += cardContentH + GAP;
+            }
           }
         }
       }
 
-      // ── PLACE ALL PIECES WITH PER-ITEM PAGE-BREAK LOGIC ─────────────────
-      for (const piece of pieces) {
-        place(piece);
-      }
-
+      // Draw footers on all pages
       const totalPages = currentPage;
-
-      // ── DRAW FOOTERS ON EVERY PAGE ───────────────────────────────────────
       for (let p = 1; p <= totalPages; p++) {
         (pdf as any).setPage(p);
         drawFooter(p, totalPages);
@@ -1099,12 +1331,14 @@ function App() {
               <div className="space-y-4">
                 {messages.map((message) => (
                   <div key={message.id}>
-                    <div ref={(el) => { messageRefs.current[message.id] = el; }}>
-                      <ChatMessage
-                        message={message}
-                        onTypingTick={() => bottomAnchorRef.current?.scrollIntoView({ behavior: 'smooth' })}
-                      />
-                    </div>
+                    <ChatMessage
+                      message={message}
+                      onTypingTick={() => bottomAnchorRef.current?.scrollIntoView({ behavior: 'smooth' })}
+                      expandedSkills={expandedSkills}
+                      snippetCursors={snippetCursors}
+                      onToggleSkills={handleToggleSkills}
+                      onShowNextSnippet={handleShowNextSnippet}
+                    />
                     {message.allResults && message.allResults.length > (message.displayCount || 10) && (
                       <div className="mt-4 text-center">
                         <button
@@ -1135,7 +1369,7 @@ function App() {
               <button
                 onClick={() => setShowExamples(v => !v)}
                 className="flex items-center justify-between w-full mb-2 group"
-                style={{ transition: 'transform 0.15s ease', '--hover-lift': '-2px' } as React.CSSProperties}
+                style={{ transition: 'transform 0.15s ease' } as React.CSSProperties}
                 onMouseEnter={(e) => { e.currentTarget.style.transform = 'translateY(-2px)'; }}
                 onMouseLeave={(e) => { e.currentTarget.style.transform = 'translateY(0)'; }}
                 title={showExamples ? 'Hide examples' : 'Show examples'}
