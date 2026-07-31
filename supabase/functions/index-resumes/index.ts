@@ -112,9 +112,16 @@ Deno.serve(async (req: Request) => {
   try {
     const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
 
-    const tenantId = Deno.env.get('AZURE_TENANT_ID');
-    const clientId = Deno.env.get('AZURE_CLIENT_ID');
-    const clientSecret = Deno.env.get('AZURE_API_SECRET') || Deno.env.get('AZURE_CLIENT_SECRET');
+    const tenantId = Deno.env.get('SHAREPOINT_TENANT_ID') || Deno.env.get('AZURE_TENANT_ID');
+    const clientId = Deno.env.get('SHAREPOINT_CLIENT_ID') || Deno.env.get('AZURE_CLIENT_ID');
+    const clientSecret = Deno.env.get('SHAREPOINT_CLIENT_SECRET') || Deno.env.get('AZURE_CLIENT_SECRET') || Deno.env.get('AZURE_API_KEY');
+
+    if (!tenantId || !clientId || !clientSecret) {
+      return new Response(JSON.stringify({ error: 'Azure credentials not configured. Set SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET (or AZURE_* equivalents) in the edge function secrets.' }), {
+        status: 500,
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
 
     const tokenRes = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
       method: 'POST',

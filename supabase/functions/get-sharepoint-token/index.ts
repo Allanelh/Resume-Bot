@@ -6,17 +6,20 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const AZURE_TENANT_ID = Deno.env.get('AZURE_TENANT_ID');
-const AZURE_CLIENT_ID = Deno.env.get('AZURE_CLIENT_ID');
-const AZURE_CLIENT_SECRET = Deno.env.get('AZURE_CLIENT_SECRET');
+const AZURE_TENANT_ID = Deno.env.get('SHAREPOINT_TENANT_ID') || Deno.env.get('AZURE_TENANT_ID');
+const AZURE_CLIENT_ID = Deno.env.get('SHAREPOINT_CLIENT_ID') || Deno.env.get('AZURE_CLIENT_ID');
+const AZURE_API_KEY = Deno.env.get('SHAREPOINT_CLIENT_SECRET') || Deno.env.get('AZURE_CLIENT_SECRET') || Deno.env.get('AZURE_API_KEY');
 
 async function getAccessToken(): Promise<string> {
+  if (!AZURE_TENANT_ID || !AZURE_CLIENT_ID || !AZURE_API_KEY) {
+    throw new Error('Azure credentials not configured. Set SHAREPOINT_TENANT_ID, SHAREPOINT_CLIENT_ID, SHAREPOINT_CLIENT_SECRET (or AZURE_* equivalents) in the edge function secrets.');
+  }
   try {
     const tokenUrl = `https://login.microsoftonline.com/${AZURE_TENANT_ID}/oauth2/v2.0/token`;
 
     const params = new URLSearchParams({
       client_id: AZURE_CLIENT_ID!,
-      client_secret: AZURE_CLIENT_SECRET!,
+      client_secret: AZURE_API_KEY!,
       scope: 'https://graph.microsoft.com/.default',
       grant_type: 'client_credentials',
     });
