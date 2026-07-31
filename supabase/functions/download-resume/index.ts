@@ -6,7 +6,16 @@ const corsHeaders = {
 
 const AZURE_TENANT_ID = Deno.env.get('AZURE_TENANT_ID');
 const AZURE_CLIENT_ID = Deno.env.get('AZURE_CLIENT_ID');
-const AZURE_API_KEY = Deno.env.get('AZURE_API_KEY');
+const AZURE_API_SECRET = Deno.env.get('AZURE_API_SECRET');
+
+console.log("Vault Tenant ID:", Deno.env.get('AZURE_TENANT_ID')?.substring(0, 4));
+console.log("Vault Client ID:", Deno.env.get('AZURE_CLIENT_ID')?.substring(0, 4));
+console.log("Vault Secret length:", Deno.env.get('AZURE_CLIENT_SECRET')?.length);
+console.log("Old API Key length:", Deno.env.get('AZURE_API_SECRET')?.length);
+
+
+console.log("Vault Secret starts with:", Deno.env.get('AZURE_CLIENT_SECRET')?.substring(0, 4));
+console.log("Vault Secret length:", Deno.env.get('AZURE_CLIENT_SECRET')?.length);
 
 async function getAccessToken(): Promise<string> {
   try {
@@ -14,7 +23,7 @@ async function getAccessToken(): Promise<string> {
 
     const params = new URLSearchParams({
       client_id: AZURE_CLIENT_ID!,
-      client_secret: AZURE_API_KEY!,
+      client_secret: AZURE_API_SECRET!,
       scope: 'https://graph.microsoft.com/.default',
       grant_type: 'client_credentials',
     });

@@ -114,7 +114,7 @@ Deno.serve(async (req: Request) => {
 
     const tenantId = Deno.env.get('AZURE_TENANT_ID');
     const clientId = Deno.env.get('AZURE_CLIENT_ID');
-    const clientSecret = Deno.env.get('AZURE_API_KEY') || Deno.env.get('AZURE_CLIENT_SECRET');
+    const clientSecret = Deno.env.get('AZURE_API_SECRET') || Deno.env.get('AZURE_CLIENT_SECRET');
 
     const tokenRes = await fetch(`https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`, {
       method: 'POST',

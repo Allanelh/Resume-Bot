@@ -8,7 +8,7 @@ const corsHeaders = {
 
 const AZURE_TENANT_ID = Deno.env.get('AZURE_TENANT_ID');
 const AZURE_CLIENT_ID = Deno.env.get('AZURE_CLIENT_ID');
-const AZURE_API_KEY = Deno.env.get('AZURE_API_KEY');
+const AZURE_CLIENT_SECRET = Deno.env.get('AZURE_CLIENT_SECRET');
 
 async function getAccessToken(): Promise<string> {
   try {
@@ -16,7 +16,7 @@ async function getAccessToken(): Promise<string> {
 
     const params = new URLSearchParams({
       client_id: AZURE_CLIENT_ID!,
-      client_secret: AZURE_API_KEY!,
+      client_secret: AZURE_CLIENT_SECRET!,
       scope: 'https://graph.microsoft.com/.default',
       grant_type: 'client_credentials',
     });
