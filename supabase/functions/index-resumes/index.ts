@@ -220,6 +220,15 @@ function extractTextFromDocBinary(arrayBuffer: ArrayBuffer): string {
   return lines.join('\n').replace(/\s{3,}/g, '  ').trim();
 }
 
+function sanitizeForPostgres(text: string): string {
+  if (!text) return '';
+  return text
+    .replace(/\u0000/g, '')
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, '')
+    .replace(/\uFFFD/g, ' ')
+    .trim();
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
 
@@ -323,18 +332,24 @@ Deno.serve(async (req: Request) => {
           content = new TextDecoder().decode(arrayBuffer);
         }
 
-        content = content.slice(0, 50000);
+        content = sanitizeForPostgres(content.slice(0, 50000));
+        const candidateName = sanitizeForPostgres(file.name.replace(/\.[^/.]+$/, ''));
+        const safeFileName = sanitizeForPostgres(file.name);
 
-        const candidateName = file.name.replace(/\.[^/.]+$/, '');
-
-        const { data: resumeData } = await supabase.from('resumes').upsert({
-          file_name: file.name,
+        const { data: resumeData, error: upsertError } = await supabase.from('resumes').upsert({
+          file_name: safeFileName,
           file_url: downloadUrl,
           drive_item_id: file.id,
           content_text: content,
           candidate_name: candidateName,
           last_modified: file.lastModifiedDateTime
         }, { onConflict: 'file_name' }).select().single();
+
+        if (upsertError) {
+          failed++;
+          console.error(`DB insert failed for ${file.name}:`, upsertError.message);
+          continue;
+        }
 
         if (resumeData) {
           const skills = extractSkills(content);
