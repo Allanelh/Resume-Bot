@@ -104,29 +104,56 @@ export default function ConfigModal({ onClose, currentUrl, onSave }: ConfigModal
 
   const handleIndexResumes = async () => {
     if (!sharePointUrl.trim()) {
-      setMessage('Please save the SharePoint URL first');
+      setMessage('Please enter a SharePoint folder URL');
       return;
     }
 
     setIsIndexing(true);
-    setMessage('Starting indexing process...');
+    setMessage('Saving URL and starting fresh index...');
+
+    // Auto-save the URL to the database before indexing so the backend
+    // (and download-resume function) always uses the latest URL.
+    try {
+      const { data: existing } = await supabase
+        .from('app_config')
+        .select('*')
+        .eq('config_key', 'sharepoint_folder_url')
+        .maybeSingle();
+
+      if (existing) {
+        await supabase
+          .from('app_config')
+          .update({
+            config_value: sharePointUrl,
+            updated_at: new Date().toISOString(),
+          })
+          .eq('config_key', 'sharepoint_folder_url');
+      } else {
+        await supabase.from('app_config').insert({
+          config_key: 'sharepoint_folder_url',
+          config_value: sharePointUrl,
+        });
+      }
+    } catch (error) {
+      console.error('Error saving config before indexing:', error);
+      setMessage('Error saving configuration. Please try again.');
+      setIsIndexing(false);
+      return;
+    }
+
+    setMessage('Indexing in progress... This will wipe all old resumes and load all files from the new folder.');
 
     try {
-      let hasMore = true;
-      let currentOffset = 0;
+      const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/index-resumes`;
+      let offset = 0;
+      const batchSize = 15;
       let totalIndexed = 0;
-      let totalSkipped = 0;
-      let totalUpdated = 0;
+      let totalFailed = 0;
       let totalFiles = 0;
+      let hasMore = true;
 
-      // Loop through batches until the backend says there are no more files
       while (hasMore) {
-        setMessage(`Indexing batch... (Processed ${currentOffset} files so far)`);
-        
-        // Pass the current offset to the backend URL
-        const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/index-resumes?offset=${currentOffset}`;
-
-        const response = await fetch(apiUrl, {
+        const response = await fetch(`${apiUrl}?offset=${offset}&batch=${batchSize}`, {
           method: 'POST',
           headers: {
             'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
@@ -138,32 +165,34 @@ export default function ConfigModal({ onClose, currentUrl, onSave }: ConfigModal
         const result = await response.json();
 
         if (!response.ok) {
-          throw new Error(result.error || 'Error indexing resumes.');
+          setMessage(result.error || 'Error indexing resumes. Please try again.');
+          return;
         }
 
-        // Accumulate the numbers from this specific batch
-        totalIndexed += (result.indexed || 0);
-        totalUpdated += (result.updated || 0);
-        totalSkipped += (result.skipped || 0);
+        totalIndexed += result.indexed || 0;
+        totalFailed += result.failed || 0;
         totalFiles = result.total || totalFiles;
-
-        // Update loop conditions for the next run
         hasMore = result.hasMore;
-        currentOffset += (result.batchSize || 20);
+        offset += batchSize;
+
+        setMessage(`Indexing in progress... ${Math.min(offset, totalFiles)}/${totalFiles} files processed`);
+
+        if (hasMore) {
+          await new Promise(resolve => setTimeout(resolve, 300));
+        }
       }
 
-      // Final summary once all batches are completely finished
-      const parts = [];
-      if (totalIndexed > 0) parts.push(`${totalIndexed} new`);
-      if (totalUpdated > 0) parts.push(`${totalUpdated} updated`);
-      if (totalSkipped > 0) parts.push(`${totalSkipped} skipped (unchanged)`);
+      const parts: string[] = [];
+      if (totalIndexed > 0) parts.push(`${totalIndexed} indexed`);
+      if (totalFailed > 0) parts.push(`${totalFailed} failed`);
 
       const summary = parts.length > 0 ? parts.join(', ') : 'No changes';
       setMessage(`Indexing complete: ${summary}. Total files: ${totalFiles}`);
-      
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      onSave(sharePointUrl);
     } catch (error) {
       console.error('Error indexing resumes:', error);
-      setMessage(error instanceof Error ? error.message : 'Error connecting to indexing service. Please try again.');
+      setMessage('Error connecting to indexing service. Please try again.');
     } finally {
       setIsIndexing(false);
     }
@@ -194,7 +223,7 @@ export default function ConfigModal({ onClose, currentUrl, onSave }: ConfigModal
               type="text"
               value={sharePointUrl}
               onChange={(e) => setSharePointUrl(e.target.value)}
-              placeholder="https://humangosolutions.sharepoint.com/:f:/s/ITDepartment/IgCvfe9qjYO3..."
+              placeholder="https://humangosolutions.sharepoint.com/:f:/s/HR-Personnel/IgATS7qf9gbaQ6Wt..."
               className="w-full px-4 py-3 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:border-transparent"
               style={{ '--tw-ring-color': '#FE9900' } as React.CSSProperties}
               onFocus={(e) => e.currentTarget.style.borderColor = '#FE9900'}
@@ -299,9 +328,11 @@ export default function ConfigModal({ onClose, currentUrl, onSave }: ConfigModal
             <ol className="text-sm text-slate-600 space-y-2 list-decimal list-inside">
               <li>Paste your SharePoint folder URL</li>
               <li>Click "Authenticate with Azure" (configured automatically)</li>
-              <li>Click "Save Configuration"</li>
-              <li>Click "Index Resumes" to scan and load all resume files</li>
+              <li>Click "Index Resumes" — this saves the URL, wipes old files, and loads all resumes from the new folder</li>
             </ol>
+            <p className="mt-2 text-xs text-slate-400">
+              Note: Indexing automatically replaces all previously loaded resumes with files from the new folder.
+            </p>
           </div>
         </div>
       </div>

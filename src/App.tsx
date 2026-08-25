@@ -518,19 +518,83 @@ function App() {
   const searchResumes = async (query: string, preParsed?: import('./lib/nlp-parser').ParsedQuery | null): Promise<{ results: SearchResult[], totalResumes: number, flaggedUnreadable?: SearchResult[] }> => {
     const parsedQuery = preParsed || parseNaturalLanguageQuery(query);
 
-    const { data: allResumes } = await supabase
-      .from('resumes')
-      .select(`*, certifications ( certification_name ), skills ( skill_name )`);
+    // Fetch resumes, skills, and certifications separately in paginated batches,
+    // then merge in memory. This avoids Supabase API response size limits that
+    // occur when joining large content_text rows with thousands of child rows.
+    const PAGE = 100;
 
-    if (!allResumes || allResumes.length === 0) return { results: [], totalResumes: 0 };
+    let allResumes: any[] = [];
+    let start = 0;
+    while (true) {
+      const { data: page, error } = await supabase
+        .from('resumes')
+        .select('id, file_name, file_url, drive_item_id, content_text, file_type, last_modified, indexed_at, candidate_name, created_at')
+        .range(start, start + PAGE - 1);
+      if (error) { console.error('Error fetching resumes:', error); break; }
+      if (!page || page.length === 0) break;
+      allResumes = allResumes.concat(page);
+      if (page.length < PAGE) break;
+      start += PAGE;
+    }
+
+    let allSkills: any[] = [];
+    start = 0;
+    while (true) {
+      const { data: page, error } = await supabase
+        .from('skills')
+        .select('id, resume_id, skill_name')
+        .range(start, start + PAGE - 1);
+      if (error) { console.error('Error fetching skills:', error); break; }
+      if (!page || page.length === 0) break;
+      allSkills = allSkills.concat(page);
+      if (page.length < PAGE) break;
+      start += PAGE;
+    }
+
+    let allCerts: any[] = [];
+    start = 0;
+    while (true) {
+      const { data: page, error } = await supabase
+        .from('certifications')
+        .select('id, resume_id, certification_name')
+        .range(start, start + PAGE - 1);
+      if (error) { console.error('Error fetching certs:', error); break; }
+      if (!page || page.length === 0) break;
+      allCerts = allCerts.concat(page);
+      if (page.length < PAGE) break;
+      start += PAGE;
+    }
+
+    const skillsByResume = new Map<string, string[]>();
+    for (const s of allSkills) {
+      const arr = skillsByResume.get(s.resume_id) || [];
+      arr.push(s.skill_name);
+      skillsByResume.set(s.resume_id, arr);
+    }
+    const certsByResume = new Map<string, string[]>();
+    for (const c of allCerts) {
+      const arr = certsByResume.get(c.resume_id) || [];
+      arr.push(c.certification_name.toLowerCase());
+      certsByResume.set(c.resume_id, arr);
+    }
+    for (const resume of allResumes) {
+      resume.skills = skillsByResume.get(resume.id) || [];
+      resume.certifications = certsByResume.get(resume.id) || [];
+    }
+
+    if (allResumes.length === 0) return { results: [], totalResumes: 0 };
 
     const totalResumes = allResumes.length;
     const results: SearchResult[] = [];
     const flaggedUnreadable: SearchResult[] = [];
 
     for (const resume of allResumes) {
-      const certNames = resume.certifications?.map((c: any) => c.certification_name.toLowerCase()) || [];
-      const skillNames = resume.skills?.map((s: any) => s.skill_name) || [];
+      const certNames = (resume.certifications || []).map((c: any) =>
+        typeof c === 'string' ? c.toLowerCase() : (c.certification_name || '').toLowerCase()
+      ).filter(Boolean);
+      const skillNames = (resume.skills || []).map((s: any) =>
+        typeof s === 'string' ? s : (s.skill_name || '')
+      ).filter(Boolean);
       const resumeMeta = { file_name: resume.file_name, indexed_at: resume.indexed_at };
 
       const matchResult = matchResumeToQuery(resume.content_text, parsedQuery, resumeMeta);

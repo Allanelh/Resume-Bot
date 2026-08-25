@@ -4,6 +4,8 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
+import { createClient } from 'npm:@supabase/supabase-js@2.57.4';
+
 const AZURE_TENANT_ID = Deno.env.get('SHAREPOINT_TENANT_ID') || Deno.env.get('AZURE_TENANT_ID');
 const AZURE_CLIENT_ID = Deno.env.get('SHAREPOINT_CLIENT_ID') || Deno.env.get('AZURE_CLIENT_ID');
 const AZURE_API_KEY = Deno.env.get('SHAREPOINT_CLIENT_SECRET') || Deno.env.get('AZURE_CLIENT_SECRET') || Deno.env.get('AZURE_API_KEY');
@@ -78,8 +80,18 @@ Deno.serve(async (req: Request) => {
     // Get fresh access token
     const accessToken = await getAccessToken();
 
-    // Get the SharePoint site ID and drive ID from the share URL
-    const shareUrl = 'https://humangosolutions.sharepoint.com/:f:/s/ITDepartment/IgCvfe9qjYO3SZzbme7572AmAX2R5SbWXUnsb7SiBUUiUBw?e=taFyST';
+    // Read the SharePoint folder URL from the database config table
+    const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+    const { data: configData } = await supabase
+      .from('app_config')
+      .select('config_value')
+      .eq('config_key', 'sharepoint_folder_url')
+      .maybeSingle();
+
+    const shareUrl = configData?.config_value;
+    if (!shareUrl) {
+      throw new Error('No SharePoint folder URL configured. Please set one in Settings.');
+    }
 
     // Use TextEncoder and base64 encoding for Deno
     const encoder = new TextEncoder();
