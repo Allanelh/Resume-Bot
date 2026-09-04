@@ -80,12 +80,26 @@ Deno.serve(async (req: Request) => {
     // Get fresh access token
     const accessToken = await getAccessToken();
 
-    // Read the SharePoint folder URL from the database config table
+    // Read the SharePoint folder URL from the database config table.
+    // Respect the active_resume_source setting — if it's "older", use the
+    // sharepoint_folder_url_older config key instead of the default.
     const supabase = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!);
+
+    const { data: sourceData } = await supabase
+      .from('app_config')
+      .select('config_value')
+      .eq('config_key', 'active_resume_source')
+      .maybeSingle();
+
+    const activeSource = sourceData?.config_value || 'default';
+    const folderConfigKey = activeSource === 'older'
+      ? 'sharepoint_folder_url_older'
+      : 'sharepoint_folder_url';
+
     const { data: configData } = await supabase
       .from('app_config')
       .select('config_value')
-      .eq('config_key', 'sharepoint_folder_url')
+      .eq('config_key', folderConfigKey)
       .maybeSingle();
 
     const shareUrl = configData?.config_value;
