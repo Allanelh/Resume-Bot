@@ -2305,5 +2305,106 @@ export function matchResumeToQuery(
   };
 }
 
+export function extractSearchTerms(parsedQuery: ParsedQuery): string[] {
+  const terms: string[] = [];
+  const seen = new Set<string>();
+  const add = (t: string) => {
+    const lower = t.toLowerCase().trim();
+    if (lower.length >= 2 && !seen.has(lower)) {
+      seen.add(lower);
+      terms.push(lower);
+    }
+  };
+
+  // Degrees
+  if (parsedQuery.degrees.phd) {
+    add('phd'); add('ph.d'); add('doctorate'); add('doctoral');
+  }
+  if (parsedQuery.degrees.master) {
+    add('master'); add('m.s.'); add('ms'); add('mba'); add('m.a.'); add('graduate');
+  }
+  if (parsedQuery.degrees.bachelor) {
+    add('bachelor'); add('b.s.'); add('bs'); add('b.a.'); add('ba'); add('undergraduate');
+  }
+  if (parsedQuery.degrees.associate) {
+    add('associate'); add('a.s.'); add('a.a.');
+  }
+  if (parsedQuery.degrees.highSchool) {
+    add('high school'); add('ged'); add('diploma');
+  }
+  if (parsedQuery.degrees.any) {
+    add('degree'); add('university'); add('college');
+  }
+
+  // Specific field/major
+  if (parsedQuery.degrees.specificField) {
+    const keywords = MAJOR_FIELDS[parsedQuery.degrees.specificField];
+    if (keywords) keywords.forEach(add);
+    else add(parsedQuery.degrees.specificField);
+  }
+  if (parsedQuery.degrees.specificMajor) add(parsedQuery.degrees.specificMajor);
+
+  // Certifications — expand specific cert names into their synonym variants
+  for (const cert of parsedQuery.certifications.specific) {
+    const group = CERTIFICATION_SYNONYMS.find(g => g.primary === cert);
+    if (group) {
+      group.variants.forEach(add);
+    } else {
+      add(cert);
+    }
+  }
+  // General cert keywords
+  for (const cert of parsedQuery.certifications.general) add(cert);
+
+  // Skills — expand synonym variants
+  for (const skill of parsedQuery.skills.required) {
+    const group = ALL_SYNONYMS.find(g => g.primary === skill);
+    if (group) {
+      group.variants.forEach(add);
+    } else {
+      add(skill);
+    }
+  }
+
+  // OR groups
+  if (parsedQuery.skills.orGroups) {
+    for (const group of parsedQuery.skills.orGroups) {
+      for (const term of group) add(term);
+    }
+  }
+
+  // Experience
+  if (parsedQuery.experience.specificCompany) add(parsedQuery.experience.specificCompany);
+  if (parsedQuery.experience.specificRole) add(parsedQuery.experience.specificRole);
+  if (parsedQuery.experience.industry) add(parsedQuery.experience.industry);
+  if (parsedQuery.experience.clearance) {
+    add('clearance'); add('secret'); add('top secret');
+  }
+  if (parsedQuery.experience.currentlyEmployedAs && parsedQuery.experience.currentlyEmployedAs !== '__any__') {
+    add(parsedQuery.experience.currentlyEmployedAs);
+  }
+
+  // Institution
+  if (parsedQuery.institutions.specificName) add(parsedQuery.institutions.specificName);
+  if (parsedQuery.institutions.type === 'ivy_league') {
+    IVY_LEAGUE.forEach(add);
+  }
+
+  // Semantic — extract key phrases
+  const sem = parsedQuery.semantic;
+  if (sem?.leadershipWithoutTitle) { add('led team'); add('managed team'); add('supervised'); add('team lead'); }
+  if (sem?.greenfield) { add('from scratch'); add('greenfield'); add('ground up'); }
+  if (sem?.handsOnTech) { add('implemented'); add('developed'); add('built'); add('deployed'); }
+  if (sem?.fastPaced) { add('fast-paced'); add('startup'); add('fast paced'); }
+  if (sem?.customerEscalation) { add('escalation'); add('difficult'); add('irate'); }
+  if (sem?.promotedInPlace) { add('promoted'); add('promotion'); add('advanced'); }
+  if (sem?.exactTitle) add(sem.exactTitle);
+
+  // __all__ → return empty array so prefilter returns everything
+  if (parsedQuery.skills.fields.includes('__all__')) return [];
+
+  return terms;
+}
+
 export { scoreForSkill, isUnreadableResume };
 export type { SynonymGroup };
