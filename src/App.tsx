@@ -4,7 +4,8 @@ import ChatMessage, { SKILLS_PREVIEW } from './components/ChatMessage';
 import SplashScreen from './components/SplashScreen';
 import ConfigModal from './components/ConfigModal';
 import { supabase, SearchResult, SearchMetrics } from './lib/supabase';
-import { parseNaturalLanguageQuery, matchResumeToQuery, findSynonymGroup, scoreForSkill, correctFuzzyTerms } from './lib/nlp-parser';
+import { parseNaturalLanguageQuery, matchResumeToQuery, findSynonymGroup, scoreForSkill, correctFuzzyTerms, extractSearchTerms } from './lib/nlp-parser';
+import { normalizeResumeText } from './lib/text-normalizer';
 import { detectActionQuery, generateActionResponse, type ActionQuery } from './lib/action-handler';
 import {
   createSessionContext,
@@ -160,10 +161,19 @@ function App() {
   }, [messages, isTyping, isLoading]);
 
   const loadConfig = async () => {
+    const { data: activeData } = await supabase
+      .from('app_config')
+      .select('config_value')
+      .eq('config_key', 'active_resume_source')
+      .maybeSingle();
+
+    const activeSource = activeData?.config_value === 'older' ? 'older' : 'new';
+    const configKey = activeSource === 'older' ? 'sharepoint_folder_url_older' : 'sharepoint_folder_url';
+
     const { data } = await supabase
       .from('app_config')
-      .select('*')
-      .eq('config_key', 'sharepoint_folder_url')
+      .select('config_value')
+      .eq('config_key', configKey)
       .maybeSingle();
     if (data) setSharePointUrl(data.config_value);
   };
@@ -518,71 +528,106 @@ function App() {
   const searchResumes = async (query: string, preParsed?: import('./lib/nlp-parser').ParsedQuery | null): Promise<{ results: SearchResult[], totalResumes: number, flaggedUnreadable?: SearchResult[] }> => {
     const parsedQuery = preParsed || parseNaturalLanguageQuery(query);
 
-    // Fetch resumes, skills, and certifications separately in paginated batches,
-    // then merge in memory. This avoids Supabase API response size limits that
-    // occur when joining large content_text rows with thousands of child rows.
-    const PAGE = 100;
+    // ── DB-side prefilter: only download resumes whose content matches search terms ──
+    // This replaces the old approach of downloading ALL resumes in 100-row pages.
+    // For 760 resumes, this cuts network transfers from ~38MB to only matching rows.
+    const searchTerms = extractSearchTerms(parsedQuery);
 
     let allResumes: any[] = [];
-    let start = 0;
-    while (true) {
-      const { data: page, error } = await supabase
-        .from('resumes')
-        .select('id, file_name, file_url, drive_item_id, content_text, file_type, last_modified, indexed_at, candidate_name, created_at')
-        .range(start, start + PAGE - 1);
-      if (error) { console.error('Error fetching resumes:', error); break; }
-      if (!page || page.length === 0) break;
-      allResumes = allResumes.concat(page);
-      if (page.length < PAGE) break;
-      start += PAGE;
-    }
 
-    let allSkills: any[] = [];
-    start = 0;
-    while (true) {
-      const { data: page, error } = await supabase
-        .from('skills')
-        .select('id, resume_id, skill_name')
-        .range(start, start + PAGE - 1);
-      if (error) { console.error('Error fetching skills:', error); break; }
-      if (!page || page.length === 0) break;
-      allSkills = allSkills.concat(page);
-      if (page.length < PAGE) break;
-      start += PAGE;
-    }
-
-    let allCerts: any[] = [];
-    start = 0;
-    while (true) {
-      const { data: page, error } = await supabase
-        .from('certifications')
-        .select('id, resume_id, certification_name')
-        .range(start, start + PAGE - 1);
-      if (error) { console.error('Error fetching certs:', error); break; }
-      if (!page || page.length === 0) break;
-      allCerts = allCerts.concat(page);
-      if (page.length < PAGE) break;
-      start += PAGE;
-    }
-
-    const skillsByResume = new Map<string, string[]>();
-    for (const s of allSkills) {
-      const arr = skillsByResume.get(s.resume_id) || [];
-      arr.push(s.skill_name);
-      skillsByResume.set(s.resume_id, arr);
-    }
-    const certsByResume = new Map<string, string[]>();
-    for (const c of allCerts) {
-      const arr = certsByResume.get(c.resume_id) || [];
-      arr.push(c.certification_name.toLowerCase());
-      certsByResume.set(c.resume_id, arr);
-    }
-    for (const resume of allResumes) {
-      resume.skills = skillsByResume.get(resume.id) || [];
-      resume.certifications = certsByResume.get(resume.id) || [];
+    if (searchTerms.length === 0) {
+      // "Show all" or no specific terms — fetch all resumes via RPC (returns all rows)
+      const { data: rpcData, error: rpcError } = await supabase
+        .rpc('prefilter_resumes', { search_terms: [] });
+      if (rpcError) {
+        console.error('Prefilter RPC error:', rpcError);
+        // Fallback to paginated fetch
+        let start = 0;
+        while (true) {
+          const { data: page, error } = await supabase
+            .from('resumes')
+            .select('id, file_name, file_url, drive_item_id, content_text, file_type, last_modified, indexed_at, candidate_name, created_at')
+            .range(start, start + 999);
+          if (error || !page || page.length === 0) break;
+          allResumes = allResumes.concat(page);
+          if (page.length < 1000) break;
+          start += 1000;
+        }
+      } else {
+        allResumes = rpcData || [];
+      }
+    } else {
+      // Prefiltered fetch — only resumes matching any search term
+      const { data: rpcData, error: rpcError } = await supabase
+        .rpc('prefilter_resumes', { search_terms: searchTerms });
+      if (rpcError) {
+        console.error('Prefilter RPC error:', rpcError);
+        // Fallback to paginated fetch of all resumes
+        let start = 0;
+        while (true) {
+          const { data: page, error } = await supabase
+            .from('resumes')
+            .select('id, file_name, file_url, drive_item_id, content_text, file_type, last_modified, indexed_at, candidate_name, created_at')
+            .range(start, start + 999);
+          if (error || !page || page.length === 0) break;
+          allResumes = allResumes.concat(page);
+          if (page.length < 1000) break;
+          start += 1000;
+        }
+      } else {
+        allResumes = rpcData || [];
+      }
     }
 
     if (allResumes.length === 0) return { results: [], totalResumes: 0 };
+
+    // ── Fetch skills and certifications only for the matching resumes ──
+    const resumeIds = allResumes.map(r => r.id);
+
+    const skillsByResume = new Map<string, string[]>();
+    const certsByResume = new Map<string, string[]>();
+
+    // Fetch skills in batches of 200 IDs (Supabase .in() limit)
+    for (let i = 0; i < resumeIds.length; i += 200) {
+      const batchIds = resumeIds.slice(i, i + 200);
+      const { data: skillsBatch, error: skillsErr } = await supabase
+        .from('skills')
+        .select('id, resume_id, skill_name')
+        .in('resume_id', batchIds);
+      if (skillsErr) { console.error('Error fetching skills:', skillsErr); break; }
+      if (skillsBatch) {
+        for (const s of skillsBatch) {
+          const arr = skillsByResume.get(s.resume_id) || [];
+          arr.push(s.skill_name);
+          skillsByResume.set(s.resume_id, arr);
+        }
+      }
+    }
+
+    // Fetch certs in batches of 200 IDs
+    for (let i = 0; i < resumeIds.length; i += 200) {
+      const batchIds = resumeIds.slice(i, i + 200);
+      const { data: certsBatch, error: certsErr } = await supabase
+        .from('certifications')
+        .select('id, resume_id, certification_name')
+        .in('resume_id', batchIds);
+      if (certsErr) { console.error('Error fetching certs:', certsErr); break; }
+      if (certsBatch) {
+        for (const c of certsBatch) {
+          const arr = certsByResume.get(c.resume_id) || [];
+          arr.push(c.certification_name.toLowerCase());
+          certsByResume.set(c.resume_id, arr);
+        }
+      }
+    }
+
+    for (const resume of allResumes) {
+      // Normalize before matching or slicing excerpts so every result uses the
+      // same clean text, including resumes indexed before the repair existed.
+      resume.content_text = normalizeResumeText(resume.content_text || '');
+      resume.skills = skillsByResume.get(resume.id) || [];
+      resume.certifications = certsByResume.get(resume.id) || [];
+    }
 
     const totalResumes = allResumes.length;
     const results: SearchResult[] = [];
@@ -611,7 +656,7 @@ function App() {
       if (!matchResult.matches) continue;
 
       const matchedSnippets: string[] = [];
-      if (matchResult.clearanceSnippet) matchedSnippets.push(matchResult.clearanceSnippet);
+      if (matchResult.clearanceSnippet) matchedSnippets.push(normalizeResumeText(matchResult.clearanceSnippet));
 
       const findMatchingVariant = (term: string): string => {
         const group = findSynonymGroup(term);
@@ -683,7 +728,10 @@ function App() {
         for (let pos = 0; pos + WINDOW <= cleanText.length; pos += STEP) {
           const w = cleanText.slice(pos, pos + WINDOW).trim();
           if (w.length < 80) continue;
-          if (!isGibberishSnippet(w)) { matchedSnippets.push(w + (pos + WINDOW < cleanText.length ? '...' : '')); break; }
+          if (!isGibberishSnippet(w)) {
+            matchedSnippets.push(normalizeResumeText(w) + (pos + WINDOW < cleanText.length ? '...' : ''));
+            break;
+          }
         }
       }
 
@@ -762,7 +810,9 @@ function App() {
       : beforeKeyword.slice(Math.max(0, beforeKeyword.length - 140));
     const sentenceEndMatch = afterKeyword.match(/^([^.!?\n]*[.!?])/);
     const cleanAfter = sentenceEndMatch ? sentenceEndMatch[1] : afterKeyword.slice(0, 140);
-    const snippet = (cleanBefore + windowText.slice(keywordPosInWindow, keywordPosInWindow + keywordLen) + cleanAfter).trim();
+    const snippet = normalizeResumeText(
+      cleanBefore + windowText.slice(keywordPosInWindow, keywordPosInWindow + keywordLen) + cleanAfter
+    );
     if (isGibberishSnippet(snippet) || snippet.length < 20) return '';
     const addLeadingEllipsis = rawStart > 0 && !sentenceStartMatch;
     const addTrailingEllipsis = rawEnd < text.length && !sentenceEndMatch;
@@ -813,6 +863,7 @@ function App() {
       const timeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
 
       const pdf = new jsPDF('p', 'mm', 'a4');
+      (pdf as any).setCharSpace?.(0);
       const PAGE_W = 210;
       const PAGE_H = 297;
       const MARGIN = 10;
@@ -1150,6 +1201,73 @@ function App() {
             cursorY += actionH + GAP;
           }
 
+          // Helper: manually wrap text into lines that fit within maxWidth.
+          // Handles long unbreakable strings (all-caps names, titles, URLs) by
+          // breaking them character-by-character. More reliable than splitTextToSize.
+          const pdfSafeExcerptText = (text: string): string => text
+            .normalize('NFKC')
+            .replace(/[●•◦▪▸]/g, '-')
+            .replace(/[–—−]/g, '-')
+            .replace(/[“”„]/g, '"')
+            .replace(/[‘’‚]/g, "'")
+            .replace(/·/g, '-')
+            .replace(/[^\x20-\x7E\n]/g, '');
+
+          const wrapSnippetText = (text: string, maxWidth: number): string[] => {
+            // Measure with the same font/size used for drawing snippets so the
+            // width calculation exactly matches what jsPDF will render.
+            pdf.setFont('helvetica', 'normal');
+            pdf.setFontSize(7);
+            (pdf as any).setCharSpace?.(0);
+            const targetW = Math.max(1, maxWidth * 0.98);
+            const lines: string[] = [];
+
+            // Repair character-spacing corruption and sanitize non-ASCII
+            // characters that jsPDF's standard fonts can't render.
+            const cleanedText = pdfSafeExcerptText(normalizeResumeText(text));
+
+            // Break into words. We add whole words until the next word would
+            // exceed the target width, then start a new line. This fills the
+            // box completely and never cuts mid-word.
+            const words = cleanedText.split(' ').filter(Boolean);
+            let currentLine = '';
+
+            for (const word of words) {
+              const candidate = currentLine ? currentLine + ' ' + word : word;
+              const candidateW = pdf.getTextWidth(candidate);
+
+              if (candidateW <= targetW) {
+                currentLine = candidate;
+              } else {
+                // The word doesn't fit on the current line.
+                if (currentLine) {
+                  lines.push(currentLine);
+                  currentLine = '';
+                }
+                // If the single word itself is wider than the target, break it
+                // character-by-character so it doesn't overflow.
+                const wordW = pdf.getTextWidth(word);
+                if (wordW > targetW) {
+                  let charLine = '';
+                  for (const ch of word) {
+                    const chCandidate = charLine + ch;
+                    if (pdf.getTextWidth(chCandidate) > targetW && charLine) {
+                      lines.push(charLine);
+                      charLine = ch;
+                    } else {
+                      charLine = chCandidate;
+                    }
+                  }
+                  if (charLine) currentLine = charLine;
+                } else {
+                  currentLine = word;
+                }
+              }
+            }
+            if (currentLine.trim()) lines.push(currentLine.trimEnd());
+            return lines.length > 0 ? lines : [''];
+          };
+
           // Result cards
           if (msg.results && msg.results.length > 0) {
             for (const result of msg.results) {
@@ -1182,9 +1300,12 @@ function App() {
               if (visibleSnippets.length > 0) {
                 cardContentH += 7;
                 const snipW = CARD_W - CARD_PAD * 2 - 4;
+                pdf.setFont('helvetica', 'normal');
+                pdf.setFontSize(7);
+                (pdf as any).setCharSpace?.(0);
                 for (const snippet of visibleSnippets) {
-                  pdf.setFontSize(7);
-                  const snipLines = pdf.splitTextToSize(snippet, snipW) as string[];
+                  (pdf as any).setCharSpace?.(0);
+                  const snipLines = wrapSnippetText(snippet, snipW);
                   cardContentH += snipLines.length * SNIP_LINE_H + SNIP_PAD_TOP + SNIP_PAD_BOT + 2;
                 }
               }
@@ -1283,10 +1404,15 @@ function App() {
                 pdf.text('Relevant Excerpts:', CARD_X + CARD_PAD, gy + 4);
                 gy += 7;
 
+                const snipW = CARD_W - CARD_PAD * 2 - 4;
+                const snipTextX = CARD_X + CARD_PAD + 4;
+
                 for (const snippet of visibleSnippets) {
+                  pdf.setFont('helvetica', 'normal');
                   pdf.setFontSize(7);
-                  const snipW = CARD_W - CARD_PAD * 2 - 4;
-                  const snipLines = pdf.splitTextToSize(snippet, snipW) as string[];
+                  (pdf as any).setCharSpace?.(0);
+
+                  const snipLines = wrapSnippetText(snippet, snipW);
                   const snipBoxH = snipLines.length * SNIP_LINE_H + SNIP_PAD_TOP + SNIP_PAD_BOT;
 
                   pdf.setFillColor(248, 250, 252);
@@ -1296,12 +1422,15 @@ function App() {
                   pdf.setFillColor(2, 123, 123);
                   pdf.rect(CARD_X + CARD_PAD, gy, 1.5, snipBoxH, 'F');
 
-                  pdf.setFont('helvetica', 'italic');
+                  pdf.setFont('helvetica', 'normal');
                   pdf.setFontSize(7);
+                  (pdf as any).setCharSpace?.(0);
                   pdf.setTextColor(100, 116, 139);
-                  pdf.text(snipLines, CARD_X + CARD_PAD + 4, gy + SNIP_PAD_TOP + 2.5, {
-                    lineHeightFactor: SNIP_LINE_H / (7 * 0.3528),
-                  });
+                  const snipStartY = gy + SNIP_PAD_TOP + 2.5;
+                  for (let li = 0; li < snipLines.length; li++) {
+                    (pdf as any).setCharSpace?.(0);
+                    pdf.text(snipLines[li], snipTextX, snipStartY + li * SNIP_LINE_H);
+                  }
                   gy += snipBoxH + 2;
                 }
               }
@@ -1342,7 +1471,7 @@ function App() {
                 src="https://raw.githubusercontent.com/Allanelh/Humango-Hiring-Manager-Assets/main/updatedlogo.png"
                 alt="Humango Solutions"
                 className="h-24 w-auto cursor-pointer"
-                onClick={() => { setMessages([]); setInputValue(''); sessionCtx.current = createSessionContext(); }}
+                onClick={() => { setMessages([]); setInputValue(''); sessionCtx.current = createSessionContext(); loadConfig(); }}
                 title="Clear conversation"
               />
               <h1 className="text-3xl font-bold text-slate-800">Resume Manager</h1>
