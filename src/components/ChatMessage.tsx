@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { User, Bot, FileText, Award, Download, Code2, Filter, RefreshCw, Minus, Plus, Shuffle, AlertTriangle, GraduationCap, BookOpen, ShieldCheck, Briefcase, Building2, Star } from 'lucide-react';
 import { SearchResult, SearchMetrics, MatchReason } from '../lib/supabase';
 import type { ConversationIntent } from '../lib/conversation-context';
+import { normalizeResumeText } from '../lib/text-normalizer';
 
 interface Message {
   id: string;
@@ -175,7 +176,7 @@ function MatchReasonDisplay({ reasons, fallback }: { reasons?: MatchReason[]; fa
     return (
       <div className="flex items-start gap-2">
         <span className="text-sm font-medium text-slate-600 min-w-fit">Match Reason:</span>
-        <span className="text-sm text-slate-700">{toTitleCase(fallback)}</span>
+        <span className="text-sm text-slate-700">{toTitleCase(fallback || '')}</span>
       </div>
     );
   }
@@ -204,7 +205,7 @@ function MatchReasonDisplay({ reasons, fallback }: { reasons?: MatchReason[]; fa
 
 export const SKILLS_PREVIEW = 5;
 
-const toTitleCase = (str: string) => str.replace(/\b\w/g, (c) => c.toUpperCase());
+const toTitleCase = (str: string) => (str || '').replace(/\b\w/g, (c) => c.toUpperCase());
 
 export default function ChatMessage({ message, onTypingTick, expandedSkills, snippetCursors, onToggleSkills, onShowNextSnippet }: ChatMessageProps) {
   const isUser = message.type === 'user';
@@ -257,21 +258,27 @@ export default function ChatMessage({ message, onTypingTick, expandedSkills, sni
           },
           body: JSON.stringify({
             driveItemId: result.drive_item_id,
-            fileName: result.file_name || `${result.candidate_name}.pdf`,
+            fileName: result.file_name || `${result.candidate_name || 'resume'}.pdf`,
           }),
         }
       );
 
       if (!downloadResponse.ok) {
-        const errorData = await downloadResponse.json();
-        throw new Error(errorData.error || 'Failed to download file');
+        let errorMsg = 'Failed to download file';
+        try {
+          const errorData = await downloadResponse.json();
+          errorMsg = errorData.error || errorMsg;
+        } catch {
+          errorMsg = `Server error (${downloadResponse.status}): ${downloadResponse.statusText}`;
+        }
+        throw new Error(errorMsg);
       }
 
       const blob = await downloadResponse.blob();
       const url = window.URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = result.file_name || `${result.candidate_name}.pdf`;
+      a.download = result.file_name || `${result.candidate_name || 'resume'}.pdf`;
       document.body.appendChild(a);
       a.click();
       window.URL.revokeObjectURL(url);
@@ -343,7 +350,7 @@ export default function ChatMessage({ message, onTypingTick, expandedSkills, sni
                     <div className="flex items-center gap-2">
                       <FileText className="w-5 h-5" style={{ color: isUnreadable ? '#d97706' : '#FE9900' }} />
                       <h3 className="font-semibold text-slate-900">
-                        {result.candidate_name || result.file_name}
+                        {result.candidate_name || result.file_name || 'Unknown'}
                       </h3>
                     </div>
                     <button
@@ -443,7 +450,7 @@ export default function ChatMessage({ message, onTypingTick, expandedSkills, sni
                                 key={idx}
                                 className="text-sm text-slate-600 bg-slate-50 p-2 rounded italic"
                               >
-                                {snippet}
+                                {normalizeResumeText(snippet)}
                               </div>
                             ))}
                           </div>
