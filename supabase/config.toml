@@ -1,0 +1,8 @@
+[functions.index-resumes]
+verify_jwt = false
+
+[functions.get-sharepoint-token]
+verify_jwt = false
+
+[functions.download-resume]
+verify_jwt = false
