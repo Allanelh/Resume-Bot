@@ -229,6 +229,44 @@ function sanitizeForPostgres(text: string): string {
     .trim();
 }
 
+// PDF text extraction sometimes inserts a space between every single
+// character of a word (e.g. "D o m i n i c   C o r s o"). This repairs
+// that corruption so excerpts display normal words.
+function repairSpacedCharacters(text: string): string {
+  const normalized = text.normalize('NFKC').replace(/[\s\p{Z}\p{Cf}]+/gu, ' ').trim();
+  const tokens = normalized.split(' ').filter(Boolean);
+  if (tokens.length === 0) return '';
+
+  const SINGLE_CHAR = /^[A-Za-z0-9@._#+()\-]$/;
+  const splitCaseBoundaries = (s: string): string =>
+    s.replace(/([a-z0-9])([A-Z])/g, '$1 $2');
+
+  const output: string[] = [];
+  let run: string[] = [];
+
+  const flush = (): void => {
+    if (run.length === 0) return;
+    if (run.length >= 3) {
+      output.push(splitCaseBoundaries(run.join('')));
+    } else {
+      output.push(...run);
+    }
+    run = [];
+  };
+
+  for (const token of tokens) {
+    if (token.length === 1 && SINGLE_CHAR.test(token)) {
+      run.push(token);
+    } else {
+      flush();
+      output.push(token);
+    }
+  }
+  flush();
+
+  return output.join(' ').replace(/\s+([.,;:!?])/g, '$1').trim();
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response(null, { status: 200, headers: corsHeaders });
 
@@ -292,6 +330,21 @@ Deno.serve(async (req: Request) => {
     console.log(`Found ${files.length} total items, ${processableFiles.length} processable resume files.`);
 
     const url = new URL(req.url);
+    const mode = url.searchParams.get('mode');
+
+    // ── Check Root mode: just list files, no download/index ──
+    if (mode === 'check') {
+      return new Response(JSON.stringify({
+        success: true,
+        totalItems: files.length,
+        processableFiles: processableFiles.length,
+        sampleNames: processableFiles.slice(0, 10).map((f: any) => f.name),
+        folderName: files[0]?.parentReference?.name || 'Unknown folder',
+      }), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
+      });
+    }
+
     const batchSize = parseInt(url.searchParams.get('batch') || '15');
     const offset = parseInt(url.searchParams.get('offset') || '0');
 
@@ -332,7 +385,7 @@ Deno.serve(async (req: Request) => {
           content = new TextDecoder().decode(arrayBuffer);
         }
 
-        content = sanitizeForPostgres(content.slice(0, 50000));
+        content = sanitizeForPostgres(repairSpacedCharacters(content.slice(0, 50000)));
         const candidateName = sanitizeForPostgres(file.name.replace(/\.[^/.]+$/, ''));
         const safeFileName = sanitizeForPostgres(file.name);
 
